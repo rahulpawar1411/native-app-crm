@@ -6,7 +6,7 @@ import DashboardScreen from './src/screens/DashboardScreen';
 
 // Automatically detect local machine IP in development (from Metro bundler)
 const getApiBaseUrl = () => {
-  const DEFAULT_IP = '192.168.29.129'; // Your computer's current local Wi-Fi IP
+  const DEFAULT_IP = '192.168.254.129'; // Your computer's current local Wi-Fi IP
   if (__DEV__) {
     try {
       const scriptURL = NativeModules.SourceCode?.scriptURL || '';

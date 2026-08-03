@@ -14,9 +14,11 @@ import {
   Platform,
   Image,
   ActivityIndicator,
-  RefreshControl
+  RefreshControl,
+  Share
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import * as FileSystem from 'expo-file-system';
 import * as ImagePicker from 'expo-image-picker';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
@@ -38,6 +40,26 @@ import { subscribeToSync, triggerSync } from '../services/syncEngine';
 
 export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, onLogout }) {
   const displayName = user.full_name || user.email || 'Data Operator';
+
+  const reportDOActivity = async (action, description) => {
+    try {
+      if (!apiUrl || !token) return;
+      await fetch(`${apiUrl}/api/operator-activities`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          action,
+          logType: 'activity',
+          description
+        })
+      });
+    } catch (err) {
+      console.warn('⚠️ Failed to report operator activity to backend:', err.message);
+    }
+  };
 
   // Navigation Tab State: 'Dashboard' | 'Tasks' | 'Reports' | 'More'
   const [currentNavTab, setCurrentNavTab] = useState('Dashboard');
@@ -66,11 +88,21 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
   // IP Edit Modal States
   const [showIpEditModal, setShowIpEditModal] = useState(false);
   const [ipInput, setIpInput] = useState(apiUrl);
+  const [selectedShift, setSelectedShift] = useState('10:00 AM');
+  const [activeShift, setActiveShift] = useState(new Date().getHours() >= 16 ? 'Evening' : 'Morning');
   
   // Inputs & captures state
   const [tempInput, setTempInput] = useState('');
   const [boxCountInput, setBoxCountInput] = useState('');
   const [capturedImage, setCapturedImage] = useState(null);
+  const [capturedImageTimestamp, setCapturedImageTimestamp] = useState(null);
+  const [showSubmitConfirmModal, setShowSubmitConfirmModal] = useState(false);
+  const [isLoadingData, setIsLoadingData] = useState(true);
+  const [showDrawer, setShowDrawer] = useState(false);
+  const [selectedReportDate, setSelectedReportDate] = useState(new Date().toISOString().split('T')[0]);
+  const [showCalendarModal, setShowCalendarModal] = useState(false);
+  const [showInventoryModal, setShowInventoryModal] = useState(false);
+  const [calendarMonth, setCalendarMonth] = useState(new Date());
   const [showClientDropdown, setShowClientDropdown] = useState(false);
   const [showChamberDropdown, setShowChamberDropdown] = useState(false);
   const [showAddClientModal, setShowAddClientModal] = useState(false);
@@ -162,6 +194,37 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
     setIpInput(apiUrl);
   }, [apiUrl]);
 
+  // Pre-select shift based on active shift filter when modal opens in editable mode
+  useEffect(() => {
+    if (showLogModal && isProfileEditable) {
+      setSelectedShift(activeShift === 'Morning' ? '10:00 AM' : '04:00 PM');
+    }
+  }, [showLogModal, isProfileEditable, activeShift]);
+
+  // Recalculate pending tasks count whenever activeShift, completedLogs or assignments change
+  useEffect(() => {
+    const todayStr = new Date().toISOString().split('T')[0];
+    const targetShiftTime = activeShift === 'Morning' ? '10:00 AM' : '04:00 PM';
+    const activeAssignmentsToday = assignments.filter(item => item.status !== 'inactive');
+
+    const pendingTasksList = activeAssignmentsToday.filter(item => {
+      // Check if this assignment has a completed log for today on the selected shift
+      const log = completedLogs.find(l => 
+        l.chamber_id === item.chamber_id && 
+        l.client_name === item.client_name &&
+        l.entry_date === todayStr &&
+        l.entry_time === targetShiftTime
+      );
+      const isCompleted = !!log;
+      if (isCompleted) return false;
+      
+      const chamberTasks = activeAssignmentsToday.filter(t => t.chamber_id === item.chamber_id);
+      return chamberTasks.length > 1;
+    });
+    
+    setPendingCount(pendingTasksList.length);
+  }, [activeShift, completedLogs, assignments]);
+
   // 3. Initialize SQLite DB and Sync Services
   useEffect(() => {
     initDatabase();
@@ -243,9 +306,30 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
 
     // Active assignments today (excluding soft-deleted / inactive ones)
     const activeAssignmentsToday = currAssignments.filter(item => item.status !== 'inactive');
-    let totalAssignments = activeAssignmentsToday.length;
-    let completedToday = todaysInspections.length;
-    setPendingCount(Math.max(0, totalAssignments - completedToday));
+    
+    // Calculate pending count for chambers with more than 1 client task, taking shift-time and current hour into account
+    const currentHour = new Date().getHours();
+    const activeShiftTasks = [];
+    activeAssignmentsToday.forEach(item => {
+      activeShiftTasks.push({ ...item, shift_time: '10:00 AM' });
+      if (currentHour >= 16) {
+        activeShiftTasks.push({ ...item, shift_time: '04:00 PM' });
+      }
+    });
+
+    const pendingTasksList = activeShiftTasks.filter(item => {
+      const log = todaysInspections.find(l => 
+        l.chamber_id === item.chamber_id && 
+        l.client_name === item.client_name &&
+        l.entry_time === item.shift_time
+      );
+      const isCompleted = !!log;
+      if (isCompleted) return false;
+      
+      const chamberTasks = activeAssignmentsToday.filter(t => t.chamber_id === item.chamber_id);
+      return chamberTasks.length > 1;
+    });
+    setPendingCount(pendingTasksList.length);
 
     // Calculate Overdue tasks for the past 5 days
     const allInspections = getAllLocalInspections();
@@ -286,6 +370,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
     
     setOverdueTasks(overdueList);
     setOverdueCount(overdueList.length);
+    setIsLoadingData(false);
   };
 
   // Launch phone camera to snap box photo
@@ -299,6 +384,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
 
       if (!result.canceled && result.assets && result.assets.length > 0) {
         setCapturedImage(result.assets[0].uri);
+        setCapturedImageTimestamp(Date.now());
       }
     } catch (error) {
       Alert.alert('Camera Error', 'Could not access device camera.');
@@ -320,16 +406,48 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
       setTempInput(existingLog.box_temp.toString());
       setBoxCountInput(existingLog.box_count ? existingLog.box_count.toString() : '');
       setCapturedImage(existingLog.photo_uri);
+      if (existingLog.photo_capture_time) {
+        try {
+          const parsedDate = new Date(existingLog.photo_capture_time.replace(' ', 'T'));
+          setCapturedImageTimestamp(isNaN(parsedDate.getTime()) ? null : parsedDate.getTime());
+        } catch (e) {
+          setCapturedImageTimestamp(null);
+        }
+      } else {
+        setCapturedImageTimestamp(null);
+      }
     } else {
       setTempInput('');
       setBoxCountInput('');
       setCapturedImage(null);
+      setCapturedImageTimestamp(null);
     }
     setIsProfileEditable(true);
     setShowLogModal(true);
   };
 
-  // Save the logged inspection to SQLite and trigger sync
+  // Calculate variance between current time and captured image time
+  const getImageTimeDifferenceInMinutes = () => {
+    if (!capturedImageTimestamp) return 0;
+    const diffMs = Math.abs(Date.now() - capturedImageTimestamp);
+    return Math.floor(diffMs / (1000 * 60));
+  };
+
+  // Helper to format Date into standard YYYY-MM-DD HH:mm:ss string
+  const formatDateTime = (timestamp) => {
+    if (!timestamp) return '';
+    const dateObj = new Date(timestamp);
+    if (isNaN(dateObj.getTime())) return '';
+    const yyyy = dateObj.getFullYear();
+    const mm = String(dateObj.getMonth() + 1).padStart(2, '0');
+    const dd = String(dateObj.getDate()).padStart(2, '0');
+    const hh = String(dateObj.getHours()).padStart(2, '0');
+    const min = String(dateObj.getMinutes()).padStart(2, '0');
+    const ss = String(dateObj.getSeconds()).padStart(2, '0');
+    return `${yyyy}-${mm}-${dd} ${hh}:${min}:${ss}`;
+  };
+
+  // Validate log form and trigger confirmation popup
   const handleSaveInspection = () => {
     if (!selectedChamber) {
       Alert.alert('Validation Error', 'Please select a Chamber.');
@@ -357,12 +475,19 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
       return;
     }
 
+    setShowSubmitConfirmModal(true);
+  };
+
+  // Save the logged inspection to SQLite and trigger sync after confirmation
+  const handleConfirmSaveInspection = () => {
+    setShowSubmitConfirmModal(false);
+
     const todayStr = new Date().toISOString().split('T')[0];
     const targetDate = selectedTaskDueDate || todayStr;
-    const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const timeStr = selectedShift;
 
-    // If it's already logged for targetDate, delete the old record first to allow overwrite
-    deleteInspectionLocally(targetDate, selectedChamber.id, selectedClient);
+    // If it's already logged for targetDate and shift, delete the old record first to allow overwrite
+    deleteInspectionLocally(targetDate, selectedChamber.id, selectedClient, selectedShift);
 
     // Calculate overdue_time
     let overdueTimeStr = 'same day';
@@ -382,6 +507,8 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
       }
     }
 
+    const captureTimeStr = formatDateTime(capturedImageTimestamp || Date.now());
+
     const newLog = {
       id: `${selectedChamber.id}_${selectedClient.replace(/\s+/g, '')}_${Date.now()}`,
       operator_name: displayName,
@@ -389,18 +516,22 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
       chamber_name: selectedChamber.name,
       client_name: selectedClient,
       box_temp: parseFloat(tempInput),
-      box_count: parsedBoxCount,
+      box_count: parseInt(boxCountInput, 10),
       photo_uri: capturedImage,
       entry_date: targetDate,
       entry_time: timeStr,
       chamber_type: selectedChamberType,
-      overdue_time: overdueTimeStr
+      overdue_time: overdueTimeStr,
+      photo_capture_time: captureTimeStr,
+      shift: selectedShift === '10:00 AM' ? 'Morning' : 'Evening'
     };
 
     const success = saveInspectionLocally(newLog);
     if (success) {
       setShowLogModal(false);
       setSelectedClient(null);
+      setCapturedImage(null);
+      setCapturedImageTimestamp(null);
       
       if (currentNavTab === 'Dashboard' || openedFromFab) {
         setSelectedChamber(null);
@@ -428,6 +559,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
   const handleCloseModal = () => {
     setShowLogModal(false);
     setSelectedClient(null);
+    setCapturedImageTimestamp(null);
     if (currentNavTab === 'Dashboard' || openedFromFab) {
       setSelectedChamber(null);
       setOpenedFromFab(false);
@@ -458,6 +590,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
     if (success) {
       setNewClientInput('');
       loadLocalAssignmentsData(); 
+      reportDOActivity('ADD_CLIENT', `Added client "${clientName}" to ${managerSelectedChamber.name} with remark: Added from master panel`);
       Alert.alert('Success', `Successfully added client "${clientName}" to ${managerSelectedChamber.name}.`);
     } else {
       Alert.alert('Error', 'Failed to add client to local SQLite assignments master.');
@@ -492,7 +625,8 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
   // Details for Chamber Grid cards
   const getChamberDetails = (chamber) => {
     const pattern = getChamberTypeAndDefault(chamber.id);
-    const chamberLogs = completedLogs.filter(log => log.chamber_id === chamber.id);
+    const targetShiftTime = activeShift === 'Morning' ? '10:00 AM' : '04:00 PM';
+    const chamberLogs = completedLogs.filter(log => log.chamber_id === chamber.id && log.entry_time === targetShiftTime);
     const hasLogs = chamberLogs.length > 0;
     
     const tempVal = hasLogs ? chamberLogs[chamberLogs.length - 1].box_temp : null;
@@ -539,12 +673,14 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
   const getFilteredChambers = () => {
     if (activeTab === 'All') return chambersList;
     return chambersList.filter(chamber => {
-      const chamberTasks = assignments.filter(item => item.chamber_id === chamber.id);
-      const chamberLogs = completedLogs.filter(log => log.chamber_id === chamber.id);
+      const chamberTasks = assignments.filter(item => item.chamber_id === chamber.id && item.status !== 'inactive');
+      const targetShiftTime = activeShift === 'Morning' ? '10:00 AM' : '04:00 PM';
+      const chamberLogs = completedLogs.filter(log => log.chamber_id === chamber.id && log.entry_time === targetShiftTime);
       const isCompleted = chamberLogs.length === chamberTasks.length && chamberTasks.length > 0;
 
       if (activeTab === 'Pending') {
-        return chamberLogs.length < chamberTasks.length;
+        const activeChamberTasks = chamberTasks.filter(t => t.status !== 'inactive');
+        return activeChamberTasks.length > 1 && chamberLogs.length < activeChamberTasks.length;
       }
       if (activeTab === 'Completed') {
         return isCompleted;
@@ -561,18 +697,39 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
     });
   };
 
-  // Filters Assignments List inside the Tasks tab
   const getFilteredAssignments = () => {
     if (activeTab === 'Overdue') {
       return overdueTasks;
     }
-    return assignments.filter(item => {
-      if (item.status === 'inactive') return false;
+    
+    // Duplicate active assignments for the two shifts (10:00 AM and 04:00 PM)
+    const shiftTasks = [];
+    assignments.forEach(item => {
+      if (item.status === 'inactive') return;
+      
+      shiftTasks.push({
+        ...item,
+        shift_time: '10:00 AM',
+        shift_label: 'Morning (10:00 AM)'
+      });
+      
+      const currentHour = new Date().getHours();
+      if (currentHour >= 16) {
+        shiftTasks.push({
+          ...item,
+          shift_time: '04:00 PM',
+          shift_label: 'Evening (04:00 PM)'
+        });
+      }
+    });
+
+    return shiftTasks.filter(item => {
       const todayStr = new Date().toISOString().split('T')[0];
       const log = completedLogs.find(l => 
         l.chamber_id === item.chamber_id && 
         l.client_name === item.client_name && 
-        l.entry_date === todayStr
+        l.entry_date === todayStr &&
+        l.entry_time === item.shift_time
       );
       const isCompleted = !!log;
       const pattern = getChamberTypeAndDefault(item.chamber_id);
@@ -586,26 +743,25 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
       }
 
       if (activeTab === 'Pending') {
-        return !isCompleted;
+        const chamberTasks = assignments.filter(t => t.chamber_id === item.chamber_id && t.status !== 'inactive');
+        return chamberTasks.length > 1 && !isCompleted;
       }
       if (activeTab === 'Completed') {
         return isCompleted;
-      }
-      if (activeTab === 'Failed') {
-        if (!isCompleted) return false;
-        return hasWarning;
       }
       return true;
     });
   };
 
   // Check if a client log exists today for a specific chamber
-  const isClientCompletedToday = (chamberId, clientName) => {
+  const isClientCompletedToday = (chamberId, clientName, entryTime = null) => {
     const todayStr = new Date().toISOString().split('T')[0];
+    const targetShiftTime = entryTime || (activeShift === 'Morning' ? '10:00 AM' : '04:00 PM');
     return completedLogs.some(log => 
       log.chamber_id === chamberId && 
       log.client_name === clientName && 
-      log.entry_date === todayStr
+      log.entry_date === todayStr &&
+      log.entry_time === targetShiftTime
     );
   };
 
@@ -630,6 +786,17 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
       setLogEntryDate(log.entry_date);
       setLogEntryTime(log.entry_time);
       
+      if (log.photo_capture_time) {
+        try {
+          const parsedDate = new Date(log.photo_capture_time.replace(' ', 'T'));
+          setCapturedImageTimestamp(isNaN(parsedDate.getTime()) ? null : parsedDate.getTime());
+        } catch (e) {
+          setCapturedImageTimestamp(null);
+        }
+      } else {
+        setCapturedImageTimestamp(null);
+      }
+      
       setIsProfileEditable(false);
       setOpenedFromFab(false);
       setShowLogModal(true);
@@ -640,14 +807,19 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
     const targetDate = item.due_date || new Date().toISOString().split('T')[0];
     setSelectedTaskDueDate(targetDate);
     
+    const targetShift = item.shift_time || '10:00 AM';
+    setSelectedShift(targetShift);
+    
     const existingLog = completedLogs.find(l => 
       l.chamber_id === item.chamber_id && 
       l.client_name === item.client_name && 
-      l.entry_date === targetDate
+      l.entry_date === targetDate &&
+      l.entry_time === targetShift
     ) || (item.is_overdue ? unsyncedLogs.find(l =>
       l.chamber_id === item.chamber_id && 
       l.client_name === item.client_name && 
-      l.entry_date === targetDate
+      l.entry_date === targetDate &&
+      l.entry_time === targetShift
     ) : null);
 
     const chamber = chambersList.find(c => c.id === item.chamber_id) || { id: item.chamber_id, name: item.chamber_name };
@@ -659,10 +831,21 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
       setBoxCountInput(existingLog.box_count ? existingLog.box_count.toString() : '');
       setCapturedImage(existingLog.photo_uri);
       setSelectedChamberType(existingLog.chamber_type || getChamberTypeAndDefault(item.chamber_id).type);
+      if (existingLog.photo_capture_time) {
+        try {
+          const parsedDate = new Date(existingLog.photo_capture_time.replace(' ', 'T'));
+          setCapturedImageTimestamp(isNaN(parsedDate.getTime()) ? null : parsedDate.getTime());
+        } catch (e) {
+          setCapturedImageTimestamp(null);
+        }
+      } else {
+        setCapturedImageTimestamp(null);
+      }
     } else {
       setTempInput('');
       setBoxCountInput('');
       setCapturedImage(null);
+      setCapturedImageTimestamp(null);
       setSelectedChamberType(getChamberTypeAndDefault(item.chamber_id).type);
     }
     
@@ -687,6 +870,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
     setTempInput('');
     setBoxCountInput('');
     setCapturedImage(null);
+    setCapturedImageTimestamp(null);
     setSelectedChamberType(getChamberTypeAndDefault(selectedChamber.id).type);
     setIsProfileEditable(true);
     setOpenedFromFab(false);
@@ -789,31 +973,120 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
           </View>
         </View>
 
+        {/* Today's Tasks Shift Selector */}
+        <View style={{ paddingHorizontal: 15, marginBottom: 15 }}>
+          <Text style={{ fontSize: 11, fontWeight: '800', color: '#64748b', textTransform: 'uppercase', marginBottom: 8, letterSpacing: 0.5 }}>
+            Today's Tasks
+          </Text>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
+            {/* Morning Shift Card */}
+            <TouchableOpacity
+              style={{
+                flex: 1,
+                backgroundColor: activeShift === 'Morning' ? '#eff6ff' : '#ffffff',
+                borderColor: activeShift === 'Morning' ? '#2563eb' : '#e2e8f0',
+                borderWidth: activeShift === 'Morning' ? 2 : 1,
+                borderRadius: 12,
+                padding: 12,
+                alignItems: 'center',
+                flexDirection: 'row',
+                marginRight: 6,
+                elevation: 1,
+                shadowColor: '#000',
+                shadowOffset: { width: 0, height: 1 },
+                shadowOpacity: 0.05,
+                shadowRadius: 2,
+              }}
+              activeOpacity={0.8}
+              onPress={() => setActiveShift('Morning')}
+            >
+              <View style={{ width: 32, height: 32, borderRadius: 16, backgroundColor: activeShift === 'Morning' ? '#2563eb' : '#f1f5f9', alignItems: 'center', justifyContent: 'center', marginRight: 8 }}>
+                <Ionicons name="sunny" size={16} color={activeShift === 'Morning' ? '#ffffff' : '#475569'} />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={{ fontSize: 13, fontWeight: '800', color: activeShift === 'Morning' ? '#1e3a8a' : '#334155' }}>
+                  Morning Shift
+                </Text>
+                <Text style={{ fontSize: 10, color: '#64748b', marginTop: 1, fontWeight: '600' }}>
+                  Target: 10:00 AM
+                </Text>
+              </View>
+            </TouchableOpacity>
+
+            {/* Evening Shift Card */}
+            {(() => {
+              const isEveningUnlocked = new Date().getHours() >= 16;
+              return (
+                <TouchableOpacity
+                  style={{
+                    flex: 1,
+                    backgroundColor: activeShift === 'Evening' ? '#eff6ff' : (isEveningUnlocked ? '#ffffff' : '#f8fafc'),
+                    borderColor: activeShift === 'Evening' ? '#2563eb' : '#e2e8f0',
+                    borderWidth: activeShift === 'Evening' ? 2 : 1,
+                    borderRadius: 12,
+                    padding: 12,
+                    alignItems: 'center',
+                    flexDirection: 'row',
+                    marginLeft: 6,
+                    opacity: isEveningUnlocked ? 1 : 0.7,
+                    elevation: 1,
+                    shadowColor: '#000',
+                    shadowOffset: { width: 0, height: 1 },
+                    shadowOpacity: 0.05,
+                    shadowRadius: 2,
+                  }}
+                  disabled={!isEveningUnlocked}
+                  activeOpacity={0.8}
+                  onPress={() => setActiveShift('Evening')}
+                >
+                  <View style={{ width: 32, height: 32, borderRadius: 16, backgroundColor: activeShift === 'Evening' ? '#2563eb' : '#f1f5f9', alignItems: 'center', justifyContent: 'center', marginRight: 8 }}>
+                    <Ionicons 
+                      name={isEveningUnlocked ? "moon" : "lock-closed"} 
+                      size={16} 
+                      color={activeShift === 'Evening' ? '#ffffff' : '#475569'} 
+                    />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ fontSize: 13, fontWeight: '800', color: activeShift === 'Evening' ? '#1e3a8a' : '#334155' }}>
+                      Evening Shift
+                    </Text>
+                    <Text style={{ fontSize: 10, color: '#64748b', marginTop: 1, fontWeight: '600' }}>
+                      {isEveningUnlocked ? 'Target: 04:00 PM' : 'Locks until 4:00 PM'}
+                    </Text>
+                  </View>
+                </TouchableOpacity>
+              );
+            })()}
+          </View>
+        </View>
+
         {/* Horizontal scroll metrics ribbon */}
         <View style={styles.metricsContainer}>
           <View style={styles.metricsHeaderRow}>
-            <Text style={styles.metricsTitle}>Pre-Alert & Pending Tasks</Text>
+            <Text style={styles.metricsTitle}>Inspection Status & Tasks</Text>
             <TouchableOpacity onPress={() => handleNavTabChange('Tasks')}>
               <Text style={styles.viewAllText}>View All</Text>
             </TouchableOpacity>
           </View>
-          <View style={styles.metricsRow}>
-            {/* 1. Failed / Out of Range Card (Red tint) */}
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.metricsRow}>
+            {/* 0. All Tasks Card (Blue tint) */}
             <TouchableOpacity 
               style={[
                 styles.metricCard, 
-                { backgroundColor: '#fff5f5', borderColor: '#ffe3e3' },
-                activeTab === 'Failed' && styles.metricCardActive
+                { backgroundColor: '#eff6ff', borderColor: '#dbeafe' },
+                activeTab === 'All' && styles.metricCardActive
               ]}
               activeOpacity={0.8}
-              onPress={() => setActiveTab(activeTab === 'Failed' ? 'All' : 'Failed')}
+              onPress={() => setActiveTab('All')}
             >
-              <View style={[styles.metricIconCircle, { backgroundColor: '#ffe3e3' }]}>
-                <Ionicons name="notifications" size={18} color="#ef4444" />
+              <View style={[styles.metricIconCircle, { backgroundColor: '#dbeafe' }]}>
+                <Ionicons name="list" size={18} color="#2563eb" />
               </View>
-              <Text style={[styles.metricValue, { color: '#ef4444' }]}>{alertCount}</Text>
-              <Text style={styles.metricLabel}>Pre-Alerts</Text>
-              <Text style={styles.metricSubtitle}>Action Required</Text>
+              <Text style={[styles.metricValue, { color: '#2563eb' }]}>
+                {assignments.filter(item => item.status !== 'inactive').length}
+              </Text>
+              <Text style={styles.metricLabel}>All Tasks</Text>
+              <Text style={styles.metricSubtitle}>Active Shift</Text>
             </TouchableOpacity>
 
             {/* 2. Pending Tasks Card (Yellow tint) */}
@@ -847,7 +1120,9 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
               <View style={[styles.metricIconCircle, { backgroundColor: '#dcfce7' }]}>
                 <Ionicons name="checkmark-circle" size={18} color="#16a34a" />
               </View>
-              <Text style={[styles.metricValue, { color: '#16a34a' }]}>{completedLogs.length}</Text>
+              <Text style={[styles.metricValue, { color: '#16a34a' }]}>
+                {completedLogs.filter(log => log.entry_time === (activeShift === 'Morning' ? '10:00 AM' : '04:00 PM')).length}
+              </Text>
               <Text style={styles.metricLabel}>Completed</Text>
               <Text style={styles.metricSubtitle}>Today</Text>
             </TouchableOpacity>
@@ -869,7 +1144,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
               <Text style={styles.metricLabel}>Overdue</Text>
               <Text style={styles.metricSubtitle}>Tasks</Text>
             </TouchableOpacity>
-          </View>
+          </ScrollView>
         </View>
 
         {/* 2-column chambers grid view */}
@@ -907,6 +1182,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                         setTempInput('');
                         setBoxCountInput('');
                         setCapturedImage(null);
+                        setCapturedImageTimestamp(null);
                         setIsProfileEditable(true);
                         setOpenedFromFab(false);
                         setShowLogModal(true);
@@ -962,50 +1238,83 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
             {/* List of client lots in this chamber */}
             <View style={styles.tasksSection}>
               <Text style={styles.tasksSectionTitle}>Client Lots Checklist</Text>
-              {assignments.filter(item => item.chamber_id === selectedChamber.id).map(item => {
-                const isCompleted = isClientCompletedToday(selectedChamber.id, item.client_name);
-                const log = completedLogs.find(l => 
-                  l.chamber_id === selectedChamber.id && 
-                  l.client_name === item.client_name
-                );
+              {(() => {
+                const chamberAssignments = assignments.filter(item => item.chamber_id === selectedChamber.id && item.status !== 'inactive');
                 
-                return (
-                  <TouchableOpacity
-                    key={item.client_name}
-                    style={[styles.taskItemCard, isCompleted && styles.taskItemCardCompleted]}
-                    activeOpacity={0.7}
-                    onPress={() => handleOpenTaskLogForm(item)}
-                  >
-                    <View style={styles.taskItemLeft}>
-                      <View style={[
-                        styles.statusIndicator,
-                        { backgroundColor: isCompleted ? '#22c55e' : '#f59e0b' }
-                      ]}>
-                        <Ionicons 
-                          name={isCompleted ? 'checkmark' : 'ellipse-outline'} 
-                          size={12} 
-                          color="#ffffff" 
-                        />
+                const listItems = [];
+                chamberAssignments.forEach(item => {
+                  listItems.push({
+                    ...item,
+                    shift_time: '10:00 AM',
+                    shift_label: 'Morning (10:00 AM)'
+                  });
+                  
+                  const currentHour = new Date().getHours();
+                  if (currentHour >= 16) {
+                    listItems.push({
+                      ...item,
+                      shift_time: '04:00 PM',
+                      shift_label: 'Evening (04:00 PM)'
+                    });
+                  }
+                });
+
+                return listItems.map((item, idx) => {
+                  const todayStr = new Date().toISOString().split('T')[0];
+                  
+                  const log = completedLogs.find(l => 
+                    l.chamber_id === selectedChamber.id && 
+                    l.client_name === item.client_name && 
+                    l.entry_date === todayStr &&
+                    l.entry_time === item.shift_time
+                  );
+                  const isCompleted = !!log;
+                  
+                  return (
+                    <TouchableOpacity
+                      key={`${item.client_name}_${item.shift_time}_${idx}`}
+                      style={[styles.taskItemCard, isCompleted && styles.taskItemCardCompleted]}
+                      activeOpacity={0.7}
+                      onPress={() => handleOpenTaskLogForm(item)}
+                    >
+                      <View style={styles.taskItemLeft}>
+                        <View style={[
+                          styles.statusIndicator,
+                          { backgroundColor: isCompleted ? '#22c55e' : '#f59e0b' }
+                        ]}>
+                          <Ionicons 
+                            name={isCompleted ? 'checkmark' : 'ellipse-outline'} 
+                            size={12} 
+                            color="#ffffff" 
+                          />
+                        </View>
+                        <View style={styles.taskDetails}>
+                          <Text style={styles.taskClientName}>{item.client_name}</Text>
+                          <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 4 }}>
+                            <View style={[styles.taskChamberBadge, { backgroundColor: item.shift_time === '10:00 AM' ? '#e0f2fe' : '#fef3c7', borderColor: item.shift_time === '10:00 AM' ? '#bae6fd' : '#fde68a', borderWidth: 0.5 }]}>
+                              <Text style={[styles.taskChamberText, { color: item.shift_time === '10:00 AM' ? '#0369a1' : '#d97706', fontSize: 9 }]}>
+                                {item.shift_label}
+                              </Text>
+                            </View>
+                          </View>
+                          <Text style={[styles.taskClientMeta, { marginTop: 4 }]}>
+                            {isCompleted ? `Logged Temp: ${log?.box_temp}°C at ${log?.entry_time}` : 'Reading Pending'}
+                          </Text>
+                        </View>
                       </View>
-                      <View style={styles.taskDetails}>
-                        <Text style={styles.taskClientName}>{item.client_name}</Text>
-                        <Text style={styles.taskClientMeta}>
-                          {isCompleted ? `Logged Temp: ${log?.box_temp}°C at ${log?.entry_time}` : 'Reading Pending'}
-                        </Text>
-                      </View>
-                    </View>
-                    
-                    {!isCompleted ? (
-                      <View style={styles.pendingActionWrapper}>
-                        <Text style={styles.pendingActionText}>Record Log</Text>
-                        <Ionicons name="chevron-forward" size={14} color="#003580" />
-                      </View>
-                    ) : (
-                      <Ionicons name="information-circle-outline" size={20} color="#16a34a" />
-                    )}
-                  </TouchableOpacity>
-                );
-              })}
+                      
+                      {!isCompleted ? (
+                        <View style={styles.pendingActionWrapper}>
+                          <Text style={styles.pendingActionText}>Record Log</Text>
+                          <Ionicons name="chevron-forward" size={14} color="#003580" />
+                        </View>
+                      ) : (
+                        <Ionicons name="information-circle-outline" size={20} color="#16a34a" />
+                      )}
+                    </TouchableOpacity>
+                  );
+                });
+              })()}
             </View>
           </>
         )}
@@ -1021,7 +1330,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
       <View style={styles.tabContainer}>
         {/* Top Filters */}
         <View style={styles.filterTabsRow}>
-          {['All', 'Pending', 'Completed', 'Failed', 'Overdue'].map((tab) => (
+          {['All', 'Pending', 'Completed', 'Overdue'].map((tab) => (
             <TouchableOpacity
               key={tab}
               style={[styles.filterTabButton, activeTab === tab && styles.filterTabButtonActive]}
@@ -1054,7 +1363,8 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                 : completedLogs.find(l => 
                     l.chamber_id === item.chamber_id && 
                     l.client_name === item.client_name && 
-                    l.entry_date === targetDate
+                    l.entry_date === targetDate &&
+                    (!item.shift_time || l.entry_time === item.shift_time)
                   );
               const isCompleted = !!log;
               const pattern = getChamberTypeAndDefault(item.chamber_id);
@@ -1092,6 +1402,13 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                         <View style={styles.taskChamberBadge}>
                           <Text style={styles.taskChamberText}>{item.chamber_name}</Text>
                         </View>
+                        {item.shift_time && (
+                          <View style={[styles.taskChamberBadge, { backgroundColor: item.shift_time === '10:00 AM' ? '#e0f2fe' : '#fef3c7', marginLeft: 6, borderColor: item.shift_time === '10:00 AM' ? '#bae6fd' : '#fde68a', borderWidth: 0.5 }]}>
+                            <Text style={[styles.taskChamberText, { color: item.shift_time === '10:00 AM' ? '#0369a1' : '#d97706' }]}>
+                              {item.shift_label}
+                            </Text>
+                          </View>
+                        )}
                         {item.is_overdue && (
                           <View style={{ backgroundColor: '#fee2e2', paddingHorizontal: 6, paddingVertical: 1.5, borderRadius: 4, marginLeft: 6, borderWidth: 0.5, borderColor: '#fca5a5' }}>
                             <Text style={{ fontSize: 9, color: '#ef4444', fontWeight: 'bold' }}>Overdue: {item.due_date}</Text>
@@ -1128,28 +1445,217 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
     );
   };
 
+  // Export tasks/logs of the selected date as a CSV file/sharing message
+  const handleExportDailyLogs = async () => {
+    try {
+      const allInspections = getAllLocalInspections();
+      const selectedDateLogs = allInspections.filter(log => log.entry_date === selectedReportDate);
+
+      if (selectedDateLogs.length === 0) {
+        Alert.alert('No Logs', `There are no inspection logs to export for ${selectedReportDate}.`);
+        return;
+      }
+
+      let csvContent = 'Date,Chamber,Type,Client,Temp (°C),Boxes,Supervisor,Status,Submission Time,Overdue\n';
+      selectedDateLogs.forEach(log => {
+        if (!log) return;
+        const pattern = typeof getChamberTypeAndDefault === 'function' ? getChamberTypeAndDefault(log.chamber_id) : { type: 'Other' };
+        const checkType = log.chamber_type || (pattern ? pattern.type : 'Other');
+        const row = [
+          log.entry_date || '',
+          log.chamber_name || '',
+          checkType || '',
+          log.client_name || '',
+          log.box_temp !== undefined && log.box_temp !== null ? log.box_temp : '',
+          log.box_count || 0,
+          log.monitor_supervisor_name || 'System',
+          log.sync_status === 'synced' ? 'Synced' : 'Pending',
+          log.entry_time || '',
+          log.overdue_time || 'same day'
+        ];
+        csvContent += row.map(val => `"${String(val !== null && val !== undefined ? val : '').replace(/"/g, '""')}"`).join(',') + '\n';
+      });
+
+      // 1. Try file sharing (progressive enhancement)
+      const fileName = `ReeferON_Logs_${selectedReportDate}.csv`;
+      const fileUri = `${FileSystem.cacheDirectory}${fileName}`;
+      await FileSystem.writeAsStringAsync(fileUri, csvContent, { encoding: FileSystem.EncodingType.UTF8 });
+
+      await Share.share({
+        url: fileUri,
+        title: `Export Logs - ${selectedReportDate}`,
+        message: Platform.OS === 'android' ? csvContent : undefined // fallback text for Android
+      });
+    } catch (err) {
+      console.warn('Primary file share failed, running fallback text share:', err.message);
+      try {
+        // Fallback: Generate simple CSV text manually and share direct
+        const allInspections = getAllLocalInspections();
+        const selectedDateLogs = allInspections.filter(log => log.entry_date === selectedReportDate);
+        
+        let csvContentFallback = 'Date,Chamber,Type,Client,Temp (°C),Boxes,Supervisor,Status,Submission Time,Overdue\n';
+        selectedDateLogs.forEach(log => {
+          if (!log) return;
+          csvContentFallback += `"${log.entry_date || ''}","${log.chamber_name || ''}","${log.chamber_type || 'Frozen'}","${log.client_name || ''}","${log.box_temp || ''}","${log.box_count || 0}","System","${log.sync_status || ''}","${log.entry_time || ''}","${log.overdue_time || ''}"\n`;
+        });
+        
+        await Share.share({
+          message: csvContentFallback,
+          title: `ReeferON Logs - ${selectedReportDate}`
+        });
+      } catch (fallbackErr) {
+        console.error('All sharing options failed:', fallbackErr);
+        Alert.alert('Export Error', `Failed to export logs: ${err.message || err}`);
+      }
+    }
+  };
+
+  // Modal to display Client Box Inventory Reports in a dedicated overlay view
+  const renderInventoryModal = () => {
+    if (!showInventoryModal) return null;
+
+    const allInspections = getAllLocalInspections();
+    
+    // Group logs
+    const clientInventory = {};
+    allInspections.forEach(log => {
+      if (!log.client_name || !log.chamber_name) return;
+      const key = `${log.client_name}_${log.chamber_name}`.toLowerCase();
+      if (!clientInventory[key]) {
+        clientInventory[key] = {
+          clientName: log.client_name,
+          chamberName: log.chamber_name,
+          chamberType: log.chamber_type || 'Frozen',
+          history: []
+        };
+      }
+      clientInventory[key].history.push({
+        date: log.entry_date,
+        boxCount: log.box_count || 0,
+        temp: log.box_temp,
+        time: log.entry_time
+      });
+    });
+
+    const inventoryList = Object.values(clientInventory).map(item => {
+      item.history.sort((a, b) => b.date.localeCompare(a.date));
+      item.currentCount = item.history.length > 0 ? item.history[0].boxCount : 0;
+      return item;
+    });
+
+    return (
+      <Modal visible={showInventoryModal} animationType="slide" transparent={false} onRequestClose={() => setShowInventoryModal(false)}>
+        <SafeAreaView style={{ flex: 1, backgroundColor: '#f1f5f9' }}>
+          {/* Header */}
+          <View style={{
+            height: 56,
+            backgroundColor: '#003580',
+            flexDirection: 'row',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            paddingHorizontal: 16,
+            elevation: 4,
+            shadowColor: '#000',
+            shadowOffset: { width: 0, height: 2 },
+            shadowOpacity: 0.1,
+            shadowRadius: 3
+          }}>
+            <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+              <Ionicons name="cube" size={22} color="#ffffff" style={{ marginRight: 8 }} />
+              <Text style={{ fontSize: 16, fontWeight: 'bold', color: '#ffffff' }}>Client Box Inventory</Text>
+            </View>
+            <TouchableOpacity onPress={() => setShowInventoryModal(false)} style={{ padding: 4 }}>
+              <Ionicons name="close-circle" size={24} color="#ffffff" />
+            </TouchableOpacity>
+          </View>
+
+          {/* List content */}
+          <ScrollView contentContainerStyle={{ padding: 16, paddingBottom: 40 }} showsVerticalScrollIndicator={false}>
+            {inventoryList.length === 0 ? (
+              <View style={[styles.reportsEmptyRow, { backgroundColor: '#ffffff', padding: 24, borderRadius: 12 }]}>
+                <Ionicons name="cube-outline" size={32} color="#94a3b8" />
+                <Text style={[styles.reportsEmptyText, { marginTop: 10 }]}>No client inventory data logged yet.</Text>
+              </View>
+            ) : (
+              inventoryList.map((item, idx) => {
+                const latest = item.history[0];
+                const showTrend = item.history.length > 1;
+                const diff = showTrend ? (latest.boxCount - item.history[1].boxCount) : 0;
+
+                return (
+                  <View key={`${item.clientName}_${item.chamberName}_${idx}`} style={[styles.inventoryItemCard, { backgroundColor: '#ffffff', elevation: 1, shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.05, shadowRadius: 2 }]}>
+                    <View style={styles.inventoryItemHeader}>
+                      <View style={{ flex: 1, paddingRight: 8 }}>
+                        <Text style={styles.inventoryClientName}>{item.clientName}</Text>
+                        <Text style={styles.inventoryChamberLabel}>
+                          {item.chamberName} • {item.chamberType}
+                        </Text>
+                      </View>
+                      <View style={styles.inventoryCountBadge}>
+                        <Text style={styles.inventoryCountText}>{item.currentCount} Boxes</Text>
+                      </View>
+                    </View>
+
+                    {/* Trend Indicator */}
+                    {showTrend && (
+                      <View style={[styles.inventoryTrendRow, { backgroundColor: '#f8fafc' }]}>
+                        <Ionicons 
+                          name={diff < 0 ? "trending-down-outline" : "trending-up-outline"} 
+                          size={16} 
+                          color={diff < 0 ? "#ef4444" : "#16a34a"} 
+                        />
+                        <Text style={[styles.inventoryTrendText, { color: diff < 0 ? "#ef4444" : "#16a34a", flex: 1, flexWrap: 'wrap' }]}>
+                          {diff < 0 ? `Reduced by ${Math.abs(diff)}` : `Increased by ${diff}`} boxes since last reading ({item.history[1].boxCount} ➔ {latest.boxCount})
+                        </Text>
+                      </View>
+                    )}
+
+                    {/* Recent updates list */}
+                    <View style={styles.inventoryHistoryList}>
+                      <Text style={styles.historyListTitle}>Recent Logs History:</Text>
+                      {item.history.slice(0, 4).map((hist, hIdx) => (
+                        <View key={hIdx} style={styles.historyRow}>
+                          <Text style={styles.historyDate}>{hist.date} ({hist.time})</Text>
+                          <Text style={styles.historyBoxes}>{hist.boxCount} Boxes ({hist.temp}°C)</Text>
+                        </View>
+                      ))}
+                    </View>
+                  </View>
+                );
+              })
+            )}
+          </ScrollView>
+        </SafeAreaView>
+      </Modal>
+    );
+  };
+
   // C. REPORTS TAB VIEW
   const renderReportsView = () => {
-    const alertCount = completedLogs.filter(log => {
+    const allInspections = getAllLocalInspections();
+    const selectedDateLogs = allInspections.filter(log => log.entry_date === selectedReportDate);
+
+    const alertCount = selectedDateLogs.filter(log => {
       const pattern = getChamberTypeAndDefault(log.chamber_id);
-      if (pattern.type === 'Frozen') return log.box_temp > -18;
-      if (pattern.type === 'Chilled' && (log.box_temp < -5 || log.box_temp > 5)) return true;
-      if (pattern.type === 'Plus' && log.box_temp <= 0) return true;
+      const checkType = log.chamber_type || pattern.type;
+      if (checkType === 'Frozen') return log.box_temp > -18;
+      if (checkType === 'Chilled' && (log.box_temp < -5 || log.box_temp > 5)) return true;
+      if (checkType === 'Dry' && (log.box_temp < 15 || log.box_temp > 25)) return true;
       return false;
     }).length;
 
-    const complianceRate = completedLogs.length > 0 
-      ? Math.round(((completedLogs.length - alertCount) / completedLogs.length) * 100) 
+    const complianceRate = selectedDateLogs.length > 0 
+      ? Math.round(((selectedDateLogs.length - alertCount) / selectedDateLogs.length) * 100) 
       : 100;
 
     return (
       <ScrollView contentContainerStyle={styles.reportsContainer} showsVerticalScrollIndicator={false}>
         <View style={styles.reportSummaryCard}>
-          <Text style={styles.reportHeader}>Daily Compliance Summary</Text>
+          <Text style={styles.reportHeader}>Compliance Summary ({selectedReportDate})</Text>
           
           <View style={styles.statsMetricRow}>
             <View style={styles.statsBox}>
-              <Text style={styles.statsVal}>{completedLogs.length}</Text>
+              <Text style={styles.statsVal}>{selectedDateLogs.length}</Text>
               <Text style={styles.statsLbl}>Total Logs</Text>
             </View>
             <View style={styles.statsBox}>
@@ -1163,65 +1669,89 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
           </View>
         </View>
 
-        <View style={styles.chartCard}>
-          <Text style={styles.chartTitle}>Chamber Performance Graph</Text>
-          <View style={styles.barGraphContainer}>
-            {chambersList.map(ch => {
-              const details = getChamberDetails(ch);
-              const chamberLogs = completedLogs.filter(log => log.chamber_id === ch.id);
-              const hasLogs = chamberLogs.length > 0;
-              const tempVal = hasLogs ? chamberLogs[chamberLogs.length - 1].box_temp : details.displayTemp;
-              
-              let heightPct = 10;
-              if (hasLogs) {
-                const absTemp = Math.abs(tempVal);
-                heightPct = Math.min(100, Math.max(15, (absTemp / 30) * 100));
-              }
+        {/* Swipeable Date Slider & Custom Calendar Picker */}
+        {renderDateSlider()}
+        {renderCalendarModal()}
 
-              return (
-                <View key={ch.id} style={styles.graphBarColumn}>
-                  <Text style={styles.graphBarValue}>
-                    {hasLogs ? `${tempVal.toFixed(0)}°` : '--'}
-                  </Text>
-                  <View style={[
-                    styles.graphBar, 
-                    { height: `${heightPct}%`, backgroundColor: details.pillColor }
-                  ]} />
-                  <Text style={styles.graphBarLabel} numberOfLines={1}>Ch {ch.id}</Text>
-                </View>
-              );
-            })}
+        {/* Client Box Inventory Launcher Button */}
+        <TouchableOpacity 
+          style={styles.inventoryLauncherCard}
+          onPress={() => setShowInventoryModal(true)}
+        >
+          <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1 }}>
+            <View style={styles.inventoryLauncherIconBg}>
+              <Ionicons name="cube-outline" size={22} color="#003580" />
+            </View>
+            <View style={{ marginLeft: 12, flex: 1 }}>
+              <Text style={styles.inventoryLauncherTitle}>Client Box Inventory</Text>
+              <Text style={styles.inventoryLauncherSub}>View stock counts, trends & history per client</Text>
+            </View>
           </View>
-          <Text style={styles.chartSubtext}>Graph displays last recorded temperature value per chamber.</Text>
-        </View>
+          <Ionicons name="chevron-forward" size={20} color="#94a3b8" />
+        </TouchableOpacity>
 
         <View style={styles.alertLogsCard}>
-          <Text style={styles.alertLogsCardTitle}>Out-of-Range Temperature Logs</Text>
-          {completedLogs.filter(log => {
-            const pattern = getChamberTypeAndDefault(log.chamber_id);
-            if (pattern.type === 'Frozen') return log.box_temp > -18;
-            if (pattern.type === 'Chilled') return log.box_temp < -5 || log.box_temp > 5;
-            return log.box_temp <= 0;
-          }).length === 0 ? (
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+            <Text style={[styles.alertLogsCardTitle, { marginBottom: 0 }]}>Logs ({selectedReportDate})</Text>
+            {selectedDateLogs.length > 0 && (
+              <TouchableOpacity 
+                style={{ 
+                  flexDirection: 'row', 
+                  alignItems: 'center', 
+                  backgroundColor: '#003580', 
+                  paddingHorizontal: 10, 
+                  paddingVertical: 5, 
+                  borderRadius: 6 
+                }}
+                onPress={handleExportDailyLogs}
+              >
+                <Ionicons name="share-social-outline" size={14} color="#ffffff" style={{ marginRight: 4 }} />
+                <Text style={{ fontSize: 11, color: '#ffffff', fontWeight: 'bold' }}>Export CSV</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+          {selectedDateLogs.length === 0 ? (
             <View style={styles.reportsEmptyRow}>
-              <Ionicons name="shield-checkmark" size={24} color="#16a34a" />
-              <Text style={styles.reportsEmptyText}>All readings are within safe ranges today.</Text>
+              <Ionicons name="clipboard-outline" size={24} color="#94a3b8" />
+              <Text style={styles.reportsEmptyText}>No inspection logs recorded on this date.</Text>
             </View>
           ) : (
-            completedLogs.filter(log => {
+            selectedDateLogs.map(log => {
               const pattern = getChamberTypeAndDefault(log.chamber_id);
-              if (pattern.type === 'Frozen') return log.box_temp > -18;
-              if (pattern.type === 'Chilled') return log.box_temp < -5 || log.box_temp > 5;
-              return log.box_temp <= 0;
-            }).map(log => (
-              <View key={log.id} style={styles.alertLogItem}>
-                <View>
-                  <Text style={styles.alertLogClient}>{log.client_name}</Text>
-                  <Text style={styles.alertLogMeta}>{log.chamber_name} | Time: {log.entry_time}</Text>
+              const checkType = log.chamber_type || pattern.type;
+              
+              let isCompliant = true;
+              if (checkType === 'Frozen' && log.box_temp > -18) isCompliant = false;
+              if (checkType === 'Chilled' && (log.box_temp < -5 || log.box_temp > 5)) isCompliant = false;
+              if (checkType === 'Dry' && (log.box_temp < 15 || log.box_temp > 25)) isCompliant = false;
+
+              return (
+                <View key={log.id} style={styles.alertLogItem}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.alertLogClient}>{log.client_name}</Text>
+                    <Text style={styles.alertLogMeta}>
+                      {log.chamber_name} ({checkType}) | Time: {log.entry_time}
+                    </Text>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 4 }}>
+                      <Text style={{ fontSize: 10, color: log.sync_status === 'synced' ? '#16a34a' : '#c2410c', fontWeight: 'bold' }}>
+                        ● {log.sync_status === 'synced' ? 'Synced to Cloud' : 'Pending Sync'}
+                      </Text>
+                      {log.overdue_time && log.overdue_time !== 'same day' && (
+                        <Text style={{ fontSize: 9, color: '#ef4444', backgroundColor: '#fee2e2', fontWeight: 'bold', paddingHorizontal: 4, paddingVertical: 1, borderRadius: 3, marginLeft: 6 }}>
+                          Late ({log.overdue_time})
+                        </Text>
+                      )}
+                    </View>
+                  </View>
+                  <View style={{ alignItems: 'flex-end' }}>
+                    <Text style={[styles.alertLogTemp, { color: isCompliant ? '#16a34a' : '#ef4444' }]}>
+                      {log.box_temp}°C
+                    </Text>
+                    <Text style={{ fontSize: 10, color: '#64748b', marginTop: 2 }}>{log.box_count} Boxes</Text>
+                  </View>
                 </View>
-                <Text style={styles.alertLogTemp}>{log.box_temp}°C</Text>
-              </View>
-            ))
+              );
+            })
           )}
         </View>
 
@@ -1230,7 +1760,6 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
     );
   };
 
-  // D. MORE TAB VIEW
   const renderMoreView = () => {
     return (
       <ScrollView contentContainerStyle={styles.moreContainer} showsVerticalScrollIndicator={false}>
@@ -1567,6 +2096,80 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                   )}
                 </View>
 
+                {/* Shift Selector */}
+                <View style={{ marginBottom: 12 }}>
+                  <Text style={styles.modalLabel}>Shift Time (Task Slot)</Text>
+                  {isProfileEditable ? (
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 4 }}>
+                      <TouchableOpacity 
+                        style={{
+                          flex: 1,
+                          flexDirection: 'row',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          paddingVertical: 10,
+                          borderRadius: 8,
+                          borderWidth: 1.5,
+                          borderColor: selectedShift === '10:00 AM' ? '#003580' : '#e2e8f0',
+                          backgroundColor: selectedShift === '10:00 AM' ? '#f0f4f8' : '#ffffff',
+                          marginRight: 5
+                        }}
+                        onPress={() => setSelectedShift('10:00 AM')}
+                      >
+                        <Ionicons 
+                          name={selectedShift === '10:00 AM' ? 'radio-button-on' : 'radio-button-off'} 
+                          size={16} 
+                          color={selectedShift === '10:00 AM' ? '#003580' : '#64748b'} 
+                          style={{ marginRight: 6 }}
+                        />
+                        <Text style={{ 
+                          fontSize: 13, 
+                          fontWeight: '700', 
+                          color: selectedShift === '10:00 AM' ? '#003580' : '#64748b' 
+                        }}>
+                          Morning (10:00 AM)
+                        </Text>
+                      </TouchableOpacity>
+
+                      <TouchableOpacity 
+                        style={{
+                          flex: 1,
+                          flexDirection: 'row',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          paddingVertical: 10,
+                          borderRadius: 8,
+                          borderWidth: 1.5,
+                          borderColor: selectedShift === '04:00 PM' ? '#003580' : '#e2e8f0',
+                          backgroundColor: selectedShift === '04:00 PM' ? '#f0f4f8' : '#ffffff',
+                          marginLeft: 5
+                        }}
+                        onPress={() => setSelectedShift('04:00 PM')}
+                      >
+                        <Ionicons 
+                          name={selectedShift === '04:00 PM' ? 'radio-button-on' : 'radio-button-off'} 
+                          size={16} 
+                          color={selectedShift === '04:00 PM' ? '#003580' : '#64748b'} 
+                          style={{ marginRight: 6 }}
+                        />
+                        <Text style={{ 
+                          fontSize: 13, 
+                          fontWeight: '700', 
+                          color: selectedShift === '04:00 PM' ? '#003580' : '#64748b' 
+                        }}>
+                          Evening (04:00 PM)
+                        </Text>
+                      </TouchableOpacity>
+                    </View>
+                  ) : (
+                    <View style={styles.readOnlyField}>
+                      <Text style={styles.readOnlyText}>
+                        {logEntryTime === '10:00 AM' ? 'Morning Shift (10:00 AM)' : logEntryTime === '04:00 PM' ? 'Evening Shift (04:00 PM)' : `Shift: ${logEntryTime}`}
+                      </Text>
+                    </View>
+                  )}
+                </View>
+
                 {/* Client Lot Dropdown or Label */}
                 <View style={{ marginBottom: 12, position: 'relative', zIndex: 1000 }}>
                   <Text style={styles.modalLabel}>Client Lot Name</Text>
@@ -1590,7 +2193,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                             {assignments
                               .filter(item => item.chamber_id === selectedChamber?.id)
                               .map(item => {
-                                const isCompleted = isClientCompletedToday(selectedChamber.id, item.client_name);
+                                const isCompleted = isClientCompletedToday(selectedChamber.id, item.client_name, selectedShift);
                                 return (
                                   <View 
                                     key={item.client_name}
@@ -1606,17 +2209,29 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                                         const log = completedLogs.find(l => 
                                           l.chamber_id === selectedChamber.id && 
                                           l.client_name === item.client_name && 
-                                          l.entry_date === todayStr
+                                          l.entry_date === todayStr &&
+                                          l.entry_time === selectedShift
                                         );
                                         if (log) {
                                           setTempInput(log.box_temp.toString());
                                           setBoxCountInput(log.box_count ? log.box_count.toString() : '');
                                           setCapturedImage(log.photo_uri);
                                           setSelectedChamberType(log.chamber_type || getChamberTypeAndDefault(selectedChamber.id).type);
+                                          if (log.photo_capture_time) {
+                                            try {
+                                              const parsedDate = new Date(log.photo_capture_time.replace(' ', 'T'));
+                                              setCapturedImageTimestamp(isNaN(parsedDate.getTime()) ? null : parsedDate.getTime());
+                                            } catch (e) {
+                                              setCapturedImageTimestamp(null);
+                                            }
+                                          } else {
+                                            setCapturedImageTimestamp(null);
+                                          }
                                         } else {
                                           setTempInput('');
                                           setBoxCountInput('');
                                           setCapturedImage(null);
+                                          setCapturedImageTimestamp(null);
                                           setSelectedChamberType(getChamberTypeAndDefault(selectedChamber.id).type);
                                         }
                                       }}
@@ -1756,15 +2371,25 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                   
                   {isProfileEditable ? (
                     capturedImage ? (
-                      <View style={styles.verticalPhotoWrapper}>
-                        <Image source={{ uri: capturedImage }} style={styles.verticalPhotoPreview} />
-                        <TouchableOpacity 
-                          style={styles.verticalRetakeBtn}
-                          onPress={handleLaunchCamera}
-                        >
-                          <Ionicons name="camera-reverse" size={14} color="#ffffff" style={{ marginRight: 4 }} />
-                          <Text style={{ color: '#ffffff', fontSize: 12, fontWeight: 'bold' }}>Retake Photo</Text>
-                        </TouchableOpacity>
+                      <View style={{ width: '100%' }}>
+                        <View style={styles.verticalPhotoWrapper}>
+                          <Image source={{ uri: capturedImage }} style={styles.verticalPhotoPreview} />
+                          <TouchableOpacity 
+                            style={styles.verticalRetakeBtn}
+                            onPress={handleLaunchCamera}
+                          >
+                            <Ionicons name="camera-reverse" size={14} color="#ffffff" style={{ marginRight: 4 }} />
+                            <Text style={{ color: '#ffffff', fontSize: 12, fontWeight: 'bold' }}>Retake Photo</Text>
+                          </TouchableOpacity>
+                        </View>
+                        {capturedImageTimestamp && Math.abs(Date.now() - capturedImageTimestamp) > 5 * 60 * 1000 && (
+                          <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 8, alignSelf: 'center', paddingHorizontal: 10 }}>
+                            <Ionicons name="warning" size={14} color="#ef4444" style={{ marginRight: 4 }} />
+                            <Text style={{ color: '#ef4444', fontSize: 11, fontWeight: 'bold' }}>
+                              Warning: Photo captured {Math.floor(Math.abs(Date.now() - capturedImageTimestamp) / (1000 * 60))} mins ago (exceeds 5 mins)!
+                            </Text>
+                          </View>
+                        )}
                       </View>
                     ) : (
                       <TouchableOpacity 
@@ -2021,6 +2646,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                     setShowDeleteConfirmModal(false);
                     setDeleteRemarkInput('');
                     loadLocalAssignmentsData();
+                    reportDOActivity('DELETE_CLIENT', `Deleted client "${clientToDelete.clientName}" from ${clientToDelete.chamberName} with remark: ${deleteRemarkInput.trim()}`);
                     
                     // Reset selected client if it was deleted
                     if (selectedClient === clientToDelete.clientName) {
@@ -2028,6 +2654,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                       setTempInput('');
                       setBoxCountInput('');
                       setCapturedImage(null);
+                      setCapturedImageTimestamp(null);
                     }
                     
                     setClientToDelete(null);
@@ -2040,6 +2667,358 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                 <Text style={styles.dialogSaveBtnText}>Confirm Delete</Text>
               </TouchableOpacity>
             </View>
+          </View>
+        </View>
+      </Modal>
+    );
+  };
+
+  // Submission Confirmation Dialog with Photo Timestamp Alert
+  const renderSubmitConfirmModal = () => {
+    if (!showSubmitConfirmModal) return null;
+
+    const diffMins = getImageTimeDifferenceInMinutes();
+    const isVarianceAlert = diffMins > 5;
+
+    return (
+      <Modal visible={showSubmitConfirmModal} animationType="fade" transparent>
+        <View style={styles.dialogOverlay}>
+          <View style={[styles.dialogContent, { maxWidth: 340 }]}>
+            <View style={{ alignItems: 'center', marginBottom: 15 }}>
+              <View style={{
+                backgroundColor: isVarianceAlert ? '#fee2e2' : '#dcfce7', 
+                width: 50, 
+                height: 50, 
+                borderRadius: 25, 
+                alignItems: 'center', 
+                justifyContent: 'center',
+                marginBottom: 10
+              }}>
+                <Ionicons 
+                  name={isVarianceAlert ? "warning" : "checkmark-circle"} 
+                  size={30} 
+                  color={isVarianceAlert ? "#ef4444" : "#16a34a"} 
+                />
+              </View>
+              <Text style={[styles.dialogTitle, { textAlign: 'center' }]}>Confirm Submission</Text>
+            </View>
+
+            <Text style={[styles.dialogSubtitle, { textAlign: 'center', marginBottom: 20 }]}>
+              {isVarianceAlert ? (
+                <Text style={{ color: '#ef4444', fontWeight: 'bold' }}>
+                  ⚠️ Warning: The verification photo was captured {diffMins} minutes ago, which exceeds the allowed 5-minute compliance limit.
+                </Text>
+              ) : (
+                <Text style={{ color: '#16a34a', fontWeight: 'bold' }}>
+                  ✓ Verification photo capture time is compliant (captured {diffMins} minutes ago).
+                </Text>
+              )}
+            </Text>
+
+            <Text style={{ fontSize: 12, color: '#64748b', textAlign: 'center', marginBottom: 20 }}>
+              Do you want to continue and submit this inspection record?
+            </Text>
+
+            <View style={styles.dialogActionsRow}>
+              <TouchableOpacity 
+                style={styles.dialogCancelBtn}
+                onPress={() => setShowSubmitConfirmModal(false)}
+              >
+                <Text style={styles.dialogCancelBtnText}>Back</Text>
+              </TouchableOpacity>
+              <TouchableOpacity 
+                style={[
+                  styles.dialogSaveBtn, 
+                  { backgroundColor: isVarianceAlert ? '#dc2626' : '#003580' }
+                ]}
+                onPress={handleConfirmSaveInspection}
+              >
+                <Text style={styles.dialogSaveBtnText}>Continue</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+    );
+  };
+
+  // Helper to generate calendar grid days for a given month
+  const getCalendarDays = (dateObj) => {
+    const year = dateObj.getFullYear();
+    const month = dateObj.getMonth();
+    
+    const firstDay = new Date(year, month, 1);
+    const totalDays = new Date(year, month + 1, 0).getDate();
+    let startDayOfWeek = firstDay.getDay(); 
+    
+    const days = [];
+    for (let i = 0; i < startDayOfWeek; i++) {
+      days.push(null);
+    }
+    for (let day = 1; day <= totalDays; day++) {
+      days.push(new Date(year, month, day));
+    }
+    return days;
+  };
+
+  // Custom month calendar modal dialog
+  const renderCalendarModal = () => {
+    if (!showCalendarModal) return null;
+
+    const days = getCalendarDays(calendarMonth);
+    const monthName = calendarMonth.toLocaleString('default', { month: 'long', year: 'numeric' });
+    const weekDays = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+    return (
+      <Modal visible={showCalendarModal} transparent animationType="fade" onRequestClose={() => setShowCalendarModal(false)}>
+        <View style={styles.dialogOverlay}>
+          <View style={[styles.dialogContent, { width: 320, padding: 16 }]}>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+              <TouchableOpacity onPress={() => {
+                const prev = new Date(calendarMonth);
+                prev.setMonth(prev.getMonth() - 1);
+                setCalendarMonth(prev);
+              }}>
+                <Ionicons name="chevron-back" size={20} color="#003580" />
+              </TouchableOpacity>
+              
+              <Text style={{ fontSize: 14, fontWeight: 'bold', color: '#0f172a' }}>{monthName}</Text>
+              
+              <TouchableOpacity onPress={() => {
+                const next = new Date(calendarMonth);
+                next.setMonth(next.getMonth() + 1);
+                setCalendarMonth(next);
+              }}>
+                <Ionicons name="chevron-forward" size={20} color="#003580" />
+              </TouchableOpacity>
+            </View>
+
+            <View style={{ flexDirection: 'row', flexWrap: 'wrap', marginBottom: 8 }}>
+              {weekDays.map(d => (
+                <Text key={d} style={{ width: '14.28%', textAlign: 'center', fontSize: 10, color: '#64748b', fontWeight: 'bold' }}>
+                  {d[0]}
+                </Text>
+              ))}
+            </View>
+
+            <View style={{ flexDirection: 'row', flexWrap: 'wrap' }}>
+              {days.map((d, index) => {
+                if (d === null) {
+                  return <View key={`empty_${index}`} style={{ width: '14.28%', height: 34 }} />;
+                }
+                const dateStr = d.toISOString().split('T')[0];
+                const isSelected = dateStr === selectedReportDate;
+                const isToday = dateStr === new Date().toISOString().split('T')[0];
+
+                return (
+                  <TouchableOpacity
+                    key={dateStr}
+                    style={{
+                      width: '14.28%',
+                      height: 34,
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      borderRadius: 17,
+                      backgroundColor: isSelected ? '#003580' : 'transparent',
+                      borderWidth: isToday ? 1 : 0,
+                      borderColor: '#003580',
+                    }}
+                    onPress={() => {
+                      setSelectedReportDate(dateStr);
+                      setShowCalendarModal(false);
+                    }}
+                  >
+                    <Text style={{
+                      fontSize: 11,
+                      fontWeight: isSelected || isToday ? 'bold' : 'normal',
+                      color: isSelected ? '#ffffff' : '#0f172a'
+                    }}>
+                      {d.getDate()}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+
+            <TouchableOpacity 
+              style={[styles.dialogCancelBtn, { marginTop: 16, alignSelf: 'stretch', alignItems: 'center' }]}
+              onPress={() => setShowCalendarModal(false)}
+            >
+              <Text style={styles.dialogCancelBtnText}>Close</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+    );
+  };
+
+  // Horizontal Date Slider selector element
+  const renderDateSlider = () => {
+    const sliderDates = [];
+    const weekDayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    for (let i = 0; i < 7; i++) {
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      sliderDates.push(d);
+    }
+
+    return (
+      <View style={styles.sliderOuterContainer}>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.sliderScroll}>
+          {sliderDates.map((dateObj, i) => {
+            const dateStr = dateObj.toISOString().split('T')[0];
+            const isSelected = dateStr === selectedReportDate;
+            const dayName = i === 0 ? 'Today' : weekDayNames[dateObj.getDay()];
+            const dayNum = String(dateObj.getDate()).padStart(2, '0');
+
+            return (
+              <TouchableOpacity
+                key={dateStr}
+                style={[
+                  styles.sliderCard,
+                  isSelected && styles.sliderCardActive
+                ]}
+                onPress={() => setSelectedReportDate(dateStr)}
+              >
+                <Text style={[styles.sliderDayName, isSelected && styles.sliderTextActive]}>{dayName}</Text>
+                <Text style={[styles.sliderDayNum, isSelected && styles.sliderTextActive]}>{dayNum}</Text>
+              </TouchableOpacity>
+            );
+          })}
+        </ScrollView>
+        
+        <TouchableOpacity 
+          style={styles.sliderCalendarBtn}
+          onPress={() => {
+            setCalendarMonth(new Date(selectedReportDate));
+            setShowCalendarModal(true);
+          }}
+        >
+          <Ionicons name="calendar-outline" size={18} color="#003580" />
+          <Text style={styles.sliderCalendarBtnText}>Custom</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  };
+
+  // Hamburger Drawer Menu Modal
+  const renderDrawerModal = () => {
+    if (!showDrawer) return null;
+
+    const isDailyTasksActive = currentNavTab === 'Tasks' || currentNavTab === 'Reports' || currentNavTab === 'More';
+
+    return (
+      <Modal
+        visible={showDrawer}
+        animationType="none"
+        transparent
+        onRequestClose={() => setShowDrawer(false)}
+      >
+        <View style={styles.drawerOverlay}>
+          {/* Backdrop Touch Area to close */}
+          <TouchableOpacity 
+            style={styles.drawerBackdrop} 
+            activeOpacity={1} 
+            onPress={() => setShowDrawer(false)} 
+          />
+          
+          {/* Drawer Content Panel */}
+          <View style={styles.drawerPanel}>
+            {/* Drawer Header */}
+            <View style={styles.drawerHeader}>
+              <View style={styles.drawerBrandContainer}>
+                <Ionicons name="cube" size={24} color="#003580" />
+                <Text style={styles.drawerBrandText}>ReeferON CRM</Text>
+              </View>
+              <TouchableOpacity onPress={() => setShowDrawer(false)}>
+                <Ionicons name="close-circle-outline" size={26} color="#64748b" />
+              </TouchableOpacity>
+            </View>
+
+            {/* User Profile Card inside Drawer */}
+            <View style={styles.drawerUserCard}>
+              <View style={styles.drawerUserAvatar}>
+                <Ionicons name="person" size={20} color="#003580" />
+              </View>
+              <View style={{ marginLeft: 12, flex: 1 }}>
+                <Text style={styles.drawerUserName} numberOfLines={1}>
+                  {displayName}
+                </Text>
+                <Text style={styles.drawerUserRole}>
+                  {user?.role === 'do_operator' ? 'Data Operator' : 'Operator'}
+                </Text>
+              </View>
+            </View>
+
+            {/* Menu Options List */}
+            <ScrollView style={styles.drawerMenuScroll} showsVerticalScrollIndicator={false}>
+              
+              {/* Dashboard Menu Item */}
+              <TouchableOpacity 
+                style={[
+                  styles.drawerMenuItem, 
+                  currentNavTab === 'Dashboard' && styles.drawerMenuItemActive
+                ]}
+                onPress={() => {
+                  handleNavTabChange('Dashboard');
+                  setShowDrawer(false);
+                }}
+              >
+                <Ionicons 
+                  name={currentNavTab === 'Dashboard' ? 'home' : 'home-outline'} 
+                  size={20} 
+                  color={currentNavTab === 'Dashboard' ? '#003580' : '#475569'} 
+                  style={{ marginRight: 12 }}
+                />
+                <Text style={[
+                  styles.drawerMenuText,
+                  currentNavTab === 'Dashboard' && styles.drawerMenuTextActive
+                ]}>
+                  Dashboard
+                </Text>
+              </TouchableOpacity>
+
+              {/* Daily Tasks Menu Item */}
+              <TouchableOpacity 
+                style={[
+                  styles.drawerMenuItem, 
+                  isDailyTasksActive && styles.drawerMenuItemActive
+                ]}
+                onPress={() => {
+                  handleNavTabChange('Tasks');
+                  setShowDrawer(false);
+                }}
+              >
+                <Ionicons 
+                  name={isDailyTasksActive ? 'clipboard' : 'clipboard-outline'} 
+                  size={20} 
+                  color={isDailyTasksActive ? '#003580' : '#475569'} 
+                  style={{ marginRight: 12 }}
+                />
+                <Text style={[
+                  styles.drawerMenuText,
+                  isDailyTasksActive && styles.drawerMenuTextActive
+                ]}>
+                  Daily Tasks
+                </Text>
+              </TouchableOpacity>
+
+            </ScrollView>
+
+            {/* Logout Option at Bottom of Drawer */}
+            <View style={styles.drawerFooter}>
+              <TouchableOpacity 
+                style={styles.drawerLogoutBtn}
+                onPress={() => {
+                  setShowDrawer(false);
+                  onLogout();
+                }}
+              >
+                <Ionicons name="log-out-outline" size={20} color="#ef4444" style={{ marginRight: 12 }} />
+                <Text style={styles.drawerLogoutText}>Logout Session</Text>
+              </TouchableOpacity>
+            </View>
+
           </View>
         </View>
       </Modal>
@@ -2111,10 +3090,12 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                     setInlineRemarkInput('');
                     setShowAddClientModal(false);
                     loadLocalAssignmentsData();
+                    reportDOActivity('ADD_CLIENT', `Added client "${name}" inline to ${selectedChamber.name} with remark: ${remark}`);
                     setSelectedClient(name);
                     setTempInput('');
                     setBoxCountInput('');
                     setCapturedImage(null);
+                    setCapturedImageTimestamp(null);
                   } else {
                     Alert.alert('Database Error', 'Failed to add client.');
                   }
@@ -2176,6 +3157,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
               setTempInput('');
               setBoxCountInput('');
               setCapturedImage(null);
+              setCapturedImageTimestamp(null);
               setSelectedChamberType('Frozen');
               setIsProfileEditable(true);
               setShowLogModal(true);
@@ -2220,6 +3202,18 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
   };
 
   // Main UI Shell
+  if (isLoadingData) {
+    return (
+      <SafeAreaView style={[styles.container, { justifyContent: 'center', alignItems: 'center', backgroundColor: '#f1f5f9' }]}>
+        <StatusBar barStyle="dark-content" backgroundColor="#f1f5f9" />
+        <ActivityIndicator size="large" color="#003580" />
+        <Text style={{ marginTop: 15, fontSize: 13, color: '#475569', fontWeight: 'bold' }}>
+          Loading chamber data...
+        </Text>
+      </SafeAreaView>
+    );
+  }
+
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="light-content" backgroundColor="#003580" />
@@ -2227,7 +3221,9 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
       {/* Header bar */}
       <View style={styles.header}>
         <View style={styles.headerLeft}>
-          <Ionicons name="menu-outline" size={26} color="#ffffff" style={{ marginRight: 10 }} />
+          <TouchableOpacity onPress={() => setShowDrawer(true)}>
+            <Ionicons name="menu-outline" size={26} color="#ffffff" style={{ marginRight: 10 }} />
+          </TouchableOpacity>
           <Text style={styles.headerTitle}>{currentNavTab}</Text>
         </View>
         <View style={styles.headerRight}>
@@ -2254,6 +3250,9 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
       {renderClientManagerModal()}
       {renderDeleteConfirmModal()}
       {renderAddClientModal()}
+      {renderSubmitConfirmModal()}
+      {renderDrawerModal()}
+      {renderInventoryModal()}
 
       {/* Navigation Tab Bar Overlay */}
       {renderBottomTabBar()}
@@ -2472,12 +3471,10 @@ const styles = StyleSheet.create({
   },
   metricsRow: {
     flexDirection: 'row',
-    justifyContent: 'space-between',
-    width: '100%',
     paddingVertical: 4,
   },
   metricCard: {
-    flex: 1,
+    width: 95,
     borderRadius: 12,
     borderWidth: 1,
     paddingVertical: 8,
@@ -3665,5 +4662,293 @@ const styles = StyleSheet.create({
     color: '#ffffff',
     fontSize: 12,
     fontWeight: 'bold',
+  },
+  
+  // Drawer Menu Styles
+  drawerOverlay: {
+    flex: 1,
+    flexDirection: 'row',
+    backgroundColor: 'rgba(15, 23, 42, 0.4)',
+  },
+  drawerBackdrop: {
+    flex: 1,
+    height: '100%',
+  },
+  drawerPanel: {
+    width: 280,
+    height: '100%',
+    backgroundColor: '#ffffff',
+    paddingTop: Platform.OS === 'ios' ? 50 : 20,
+    shadowColor: '#0f172a',
+    shadowOffset: { width: 4, height: 0 },
+    shadowOpacity: 0.1,
+    shadowRadius: 12,
+    elevation: 16,
+  },
+  drawerHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingVertical: 15,
+    borderBottomWidth: 1,
+    borderColor: '#f1f5f9',
+  },
+  drawerBrandContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  drawerBrandText: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: '#003580',
+    marginLeft: 8,
+  },
+  drawerUserCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#f8fafc',
+    margin: 16,
+    padding: 12,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+  },
+  drawerUserAvatar: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: '#e0e7ff',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  drawerUserName: {
+    fontSize: 13,
+    fontWeight: 'bold',
+    color: '#0f172a',
+  },
+  drawerUserRole: {
+    fontSize: 10,
+    color: '#64748b',
+    marginTop: 1,
+    fontWeight: '600',
+  },
+  drawerMenuScroll: {
+    flex: 1,
+    paddingHorizontal: 16,
+  },
+  drawerMenuItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    marginBottom: 6,
+  },
+  drawerMenuItemActive: {
+    backgroundColor: '#eff6ff',
+  },
+  drawerMenuText: {
+    fontSize: 13,
+    color: '#475569',
+    fontWeight: '600',
+  },
+  drawerMenuTextActive: {
+    color: '#003580',
+    fontWeight: 'bold',
+  },
+  drawerFooter: {
+    paddingHorizontal: 16,
+    paddingVertical: 15,
+    borderTopWidth: 1,
+    borderColor: '#f1f5f9',
+    marginBottom: Platform.OS === 'ios' ? 25 : 10,
+  },
+  drawerLogoutBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+  },
+  drawerLogoutText: {
+    fontSize: 13,
+    color: '#ef4444',
+    fontWeight: 'bold',
+  },
+
+  // Date Slider & Custom Calendar Styles
+  sliderOuterContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#ffffff',
+    marginHorizontal: 16,
+    marginBottom: 14,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+    padding: 8,
+  },
+  sliderScroll: {
+    paddingRight: 10,
+  },
+  sliderCard: {
+    width: 50,
+    height: 52,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 8,
+    backgroundColor: '#f8fafc',
+    marginRight: 8,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+  },
+  sliderCardActive: {
+    backgroundColor: '#003580',
+    borderColor: '#003580',
+  },
+  sliderDayName: {
+    fontSize: 9,
+    fontWeight: 'bold',
+    color: '#64748b',
+    textTransform: 'uppercase',
+  },
+  sliderDayNum: {
+    fontSize: 14,
+    fontWeight: 'bold',
+    color: '#0f172a',
+    marginTop: 2,
+  },
+  sliderTextActive: {
+    color: '#ffffff',
+  },
+  sliderCalendarBtn: {
+    flexDirection: 'column',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingLeft: 12,
+    borderLeftWidth: 1,
+    borderLeftColor: '#e2e8f0',
+    width: 55,
+  },
+  sliderCalendarBtnText: {
+    fontSize: 9,
+    fontWeight: 'bold',
+    color: '#003580',
+    marginTop: 2,
+  },
+
+  // Client Box Inventory Styles
+  inventoryItemCard: {
+    backgroundColor: '#f8fafc',
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+    padding: 12,
+    marginBottom: 12,
+  },
+  inventoryItemHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  inventoryClientName: {
+    fontSize: 14,
+    fontWeight: 'bold',
+    color: '#0f172a',
+  },
+  inventoryChamberLabel: {
+    fontSize: 11,
+    color: '#64748b',
+    marginTop: 2,
+  },
+  inventoryCountBadge: {
+    backgroundColor: '#e0f2fe',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+  },
+  inventoryCountText: {
+    fontSize: 12,
+    fontWeight: 'bold',
+    color: '#0369a1',
+  },
+  inventoryTrendRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#ffffff',
+    padding: 8,
+    borderRadius: 6,
+    borderWidth: 0.5,
+    borderColor: '#cbd5e1',
+    marginBottom: 10,
+  },
+  inventoryTrendText: {
+    fontSize: 11,
+    fontWeight: '600',
+    marginLeft: 6,
+  },
+  inventoryHistoryList: {
+    borderTopWidth: 0.5,
+    borderColor: '#cbd5e1',
+    paddingTop: 8,
+  },
+  historyListTitle: {
+    fontSize: 10,
+    fontWeight: 'bold',
+    color: '#64748b',
+    marginBottom: 4,
+    textTransform: 'uppercase',
+  },
+  historyRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 3,
+  },
+  historyDate: {
+    fontSize: 11,
+    color: '#475569',
+  },
+  historyBoxes: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#0f172a',
+  },
+  inventoryLauncherCard: {
+    backgroundColor: '#ffffff',
+    marginHorizontal: 16,
+    marginBottom: 14,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+    padding: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    elevation: 2,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.05,
+    shadowRadius: 2,
+  },
+  inventoryLauncherIconBg: {
+    width: 38,
+    height: 38,
+    borderRadius: 8,
+    backgroundColor: '#eff6ff',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  inventoryLauncherTitle: {
+    fontSize: 14,
+    fontWeight: 'bold',
+    color: '#0f172a',
+  },
+  inventoryLauncherSub: {
+    fontSize: 11,
+    color: '#64748b',
+    marginTop: 2,
   },
 });

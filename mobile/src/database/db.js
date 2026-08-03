@@ -38,12 +38,16 @@ export const initDatabase = () => {
       console.log('🌱 SQLite: Added status column to local_assignments.');
     } catch (err) {}
 
-    // 2. Drop inspections queue table if it contains the deprecated 'temperature' column to force clean schema update
+    // 2. Drop inspections queue table if it contains the deprecated 'temperature' column or old UNIQUE constraint to force clean schema update
     try {
       const tableInfo = db.getAllSync("PRAGMA table_info(local_inspections);");
       const hasOldTemp = tableInfo.some(col => col.name === 'temperature');
-      if (hasOldTemp) {
-        console.log('🧹 SQLite: Old temperature column detected. Dropping table local_inspections for clean schema migration.');
+      
+      const sqlSchema = db.getAllSync("SELECT sql FROM sqlite_master WHERE type='table' AND name='local_inspections';");
+      const hasOldUnique = sqlSchema.length > 0 && !sqlSchema[0].sql.includes('UNIQUE(entry_date, chamber_id, client_name, entry_time)');
+
+      if (hasOldTemp || hasOldUnique) {
+        console.log('🧹 SQLite: Old table format detected. Dropping table local_inspections for clean schema migration.');
         db.execSync('DROP TABLE IF EXISTS local_inspections;');
       }
     } catch (err) {
@@ -65,8 +69,10 @@ export const initDatabase = () => {
         box_count INTEGER,
         chamber_type TEXT,
         overdue_time TEXT DEFAULT 'same day',
+        photo_capture_time TEXT,
         sync_status TEXT NOT NULL DEFAULT 'pending',
-        UNIQUE(entry_date, chamber_id, client_name) ON CONFLICT FAIL
+        shift TEXT DEFAULT 'Morning',
+        UNIQUE(entry_date, chamber_id, client_name, entry_time) ON CONFLICT FAIL
       );
     `);
 
@@ -82,6 +88,12 @@ export const initDatabase = () => {
       console.log('🌱 SQLite: Added box_count column to local_inspections.');
     } catch (err) {}
 
+    // Programmatic migrations: Add shift if table already exists without it
+    try {
+      db.execSync(`ALTER TABLE local_inspections ADD COLUMN shift TEXT DEFAULT 'Morning';`);
+      console.log('🌱 SQLite: Added shift column to local_inspections.');
+    } catch (err) {}
+
     // Programmatic migrations: Add chamber_type if table already exists without it
     try {
       db.execSync(`ALTER TABLE local_inspections ADD COLUMN chamber_type TEXT;`);
@@ -92,6 +104,12 @@ export const initDatabase = () => {
     try {
       db.execSync(`ALTER TABLE local_inspections ADD COLUMN overdue_time TEXT DEFAULT 'same day';`);
       console.log('🌱 SQLite: Added overdue_time column to local_inspections.');
+    } catch (err) {}
+
+    // Programmatic migrations: Add photo_capture_time if table already exists without it
+    try {
+      db.execSync(`ALTER TABLE local_inspections ADD COLUMN photo_capture_time TEXT;`);
+      console.log('🌱 SQLite: Added photo_capture_time column to local_inspections.');
     } catch (err) {}
     
     console.log('✅ SQLite Database Tables initialized successfully.');
@@ -145,8 +163,8 @@ export const saveInspectionLocally = (log) => {
   try {
     db.runSync(
       `INSERT INTO local_inspections 
-      (id, operator_name, chamber_id, chamber_name, client_name, box_temp, photo_uri, entry_date, entry_time, box_count, chamber_type, overdue_time, sync_status) 
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending');`,
+      (id, operator_name, chamber_id, chamber_name, client_name, box_temp, photo_uri, entry_date, entry_time, box_count, chamber_type, overdue_time, photo_capture_time, sync_status, shift) 
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?);`,
       [
         log.id,
         log.operator_name,
@@ -159,7 +177,9 @@ export const saveInspectionLocally = (log) => {
         log.entry_time,
         log.box_count !== undefined && log.box_count !== null ? parseInt(log.box_count) : null,
         log.chamber_type || 'Frozen',
-        log.overdue_time || 'same day'
+        log.overdue_time || 'same day',
+        log.photo_capture_time || null,
+        log.shift || 'Morning'
       ]
     );
     console.log(`💾 Saved inspection locally in SQLite queue: ${log.client_name} - ${log.chamber_name} (${log.chamber_type || 'Frozen'}, Overdue: ${log.overdue_time || 'same day'})`);
@@ -174,12 +194,12 @@ export const saveInspectionLocally = (log) => {
  * Verifies if an inspection has already been recorded for the given client, chamber and date.
  * Enforces the business logic: "Prevent duplicate submissions for the same client on the same day".
  */
-export const checkDuplicateInspection = (date, chamberId, clientName) => {
+export const checkDuplicateInspection = (date, chamberId, clientName, entryTime) => {
   if (!db) return false;
   try {
     const row = db.getFirstSync(
-      'SELECT COUNT(*) as count FROM local_inspections WHERE entry_date = ? AND chamber_id = ? AND client_name = ?;',
-      [date, parseInt(chamberId), clientName]
+      'SELECT COUNT(*) as count FROM local_inspections WHERE entry_date = ? AND chamber_id = ? AND client_name = ? AND entry_time = ?;',
+      [date, parseInt(chamberId), clientName, entryTime]
     );
     return row && row.count > 0;
   } catch (error) {
@@ -243,16 +263,16 @@ export const markInspectionAsSynced = (id) => {
 };
 
 /**
- * Deletes a local inspection by entry_date, chamber_id, and client_name.
+ * Deletes a local inspection by entry_date, chamber_id, client_name, and entry_time.
  */
-export const deleteInspectionLocally = (date, chamberId, clientName) => {
+export const deleteInspectionLocally = (date, chamberId, clientName, entryTime) => {
   if (!db) return false;
   try {
     db.runSync(
-      "DELETE FROM local_inspections WHERE entry_date = ? AND chamber_id = ? AND client_name = ?;",
-      [date, parseInt(chamberId), clientName]
+      "DELETE FROM local_inspections WHERE entry_date = ? AND chamber_id = ? AND client_name = ? AND entry_time = ?;",
+      [date, parseInt(chamberId), clientName, entryTime]
     );
-    console.log(`🗑️ Deleted local inspection: ${clientName} in Chamber ${chamberId} for date ${date}`);
+    console.log(`🗑️ Deleted local inspection: ${clientName} in Chamber ${chamberId} for date ${date} at ${entryTime}`);
     return true;
   } catch (error) {
     console.error('❌ Failed to delete local inspection:', error);
