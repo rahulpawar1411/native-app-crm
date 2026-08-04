@@ -72,6 +72,7 @@ export const initDatabase = () => {
         photo_capture_time TEXT,
         sync_status TEXT NOT NULL DEFAULT 'pending',
         shift TEXT DEFAULT 'Morning',
+        reference_no TEXT,
         UNIQUE(entry_date, chamber_id, client_name, entry_time) ON CONFLICT FAIL
       );
     `);
@@ -110,6 +111,12 @@ export const initDatabase = () => {
     try {
       db.execSync(`ALTER TABLE local_inspections ADD COLUMN photo_capture_time TEXT;`);
       console.log('🌱 SQLite: Added photo_capture_time column to local_inspections.');
+    } catch (err) {}
+
+    // Programmatic migrations: Add reference_no if table already exists without it
+    try {
+      db.execSync(`ALTER TABLE local_inspections ADD COLUMN reference_no TEXT;`);
+      console.log('🌱 SQLite: Added reference_no column to local_inspections.');
     } catch (err) {}
     
     console.log('✅ SQLite Database Tables initialized successfully.');
@@ -252,11 +259,14 @@ export const getAllLocalInspections = () => {
  * Marks a queued inspection as synced in the local database.
  * @param {string} id - Log ID
  */
-export const markInspectionAsSynced = (id) => {
+export const markInspectionAsSynced = (id, referenceNo) => {
   if (!db) return;
   try {
-    db.runSync("UPDATE local_inspections SET sync_status = 'synced' WHERE id = ?;", [id]);
-    console.log(`🚀 Marked inspection ${id} as SYNCED in local SQLite.`);
+    db.runSync(
+      "UPDATE local_inspections SET sync_status = 'synced', reference_no = ? WHERE id = ?;",
+      [referenceNo || null, id]
+    );
+    console.log(`🚀 Marked inspection ${id} as SYNCED with Ref: ${referenceNo} in local SQLite.`);
   } catch (error) {
     console.error('❌ Failed to mark inspection as synced:', error);
   }

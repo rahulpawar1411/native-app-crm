@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   StyleSheet,
   Text,
@@ -21,6 +21,7 @@ import { Ionicons } from '@expo/vector-icons';
 import * as FileSystem from 'expo-file-system';
 import * as ImagePicker from 'expo-image-picker';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Notifications from 'expo-notifications';
 
 // SQLite database and Sync Engine imports
 import { 
@@ -37,6 +38,15 @@ import {
   deleteLocalAssignment
 } from '../database/db';
 import { subscribeToSync, triggerSync } from '../services/syncEngine';
+
+// Configure Notifications Handler
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowAlert: true,
+    shouldPlaySound: true,
+    shouldSetBadge: true,
+  }),
+});
 
 export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, onLogout }) {
   const displayName = user.full_name || user.email || 'Data Operator';
@@ -78,6 +88,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
   const [selectedClient, setSelectedClient] = useState(null); // Active client log context
   const [openedFromFab, setOpenedFromFab] = useState(false); // Opened from the central '+' button
   const [isProfileEditable, setIsProfileEditable] = useState(true); // Edit vs Read-only toggle
+  const [reportSearchQuery, setReportSearchQuery] = useState('');
   
   // Completed Log Metadata for read-only view
   const [logOperatorName, setLogOperatorName] = useState('');
@@ -91,6 +102,107 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
   const [selectedShift, setSelectedShift] = useState('10:00 AM');
   const [activeShift, setActiveShift] = useState(new Date().getHours() >= 16 ? 'Evening' : 'Morning');
   
+  // Clicked tracking states for red notification
+  const [morningClicked, setMorningClicked] = useState(activeShift === 'Morning');
+  const [eveningClicked, setEveningClicked] = useState(activeShift === 'Evening');
+
+  useEffect(() => {
+    const loadClickedStates = async () => {
+      try {
+        const todayStr = new Date().toISOString().split('T')[0];
+        const mKey = `@morning_clicked_${todayStr}`;
+        const eKey = `@evening_clicked_${todayStr}`;
+        
+        const mVal = await AsyncStorage.getItem(mKey);
+        const eVal = await AsyncStorage.getItem(eKey);
+        
+        if (mVal === 'true') {
+          setMorningClicked(true);
+        }
+        if (eVal === 'true') {
+          setEveningClicked(true);
+        }
+      } catch (err) {
+        console.warn('Failed to load clicked states:', err);
+      }
+    };
+    loadClickedStates();
+  }, []);
+
+  useEffect(() => {
+    const initNotifications = async () => {
+      try {
+        const { status: existingStatus } = await Notifications.getPermissionsAsync();
+        let finalStatus = existingStatus;
+        if (existingStatus !== 'granted') {
+          const { status } = await Notifications.requestPermissionsAsync();
+          finalStatus = status;
+        }
+        if (finalStatus !== 'granted') {
+          console.warn('Notifications permission not granted.');
+          return;
+        }
+
+        // Cancel previous schedules to prevent duplicates
+        await Notifications.cancelAllScheduledNotificationsAsync();
+
+        // Schedule Morning Task daily at 10:00 AM
+        await Notifications.scheduleNotificationAsync({
+          content: {
+            title: "Morning Task Active! ☀️",
+            body: "Today's Morning Task is active. Open the app to complete assignments.",
+            sound: true,
+          },
+          trigger: {
+            hour: 10,
+            minute: 0,
+            repeats: true,
+          },
+        });
+
+        // Schedule Evening Task daily at 4:00 PM (16:00)
+        await Notifications.scheduleNotificationAsync({
+          content: {
+            title: "Evening Task Active! 🌙",
+            body: "Today's Evening Task is active. Open the app to complete assignments.",
+            sound: true,
+          },
+          trigger: {
+            hour: 16,
+            minute: 0,
+            repeats: true,
+          },
+        });
+
+        console.log('🔔 Offline daily task notifications scheduled successfully!');
+      } catch (err) {
+        console.warn('Failed to configure notifications:', err);
+      }
+    };
+
+    initNotifications();
+  }, []);
+
+  const handleSelectShift = async (shift) => {
+    setActiveShift(shift);
+    const todayStr = new Date().toISOString().split('T')[0];
+    if (shift === 'Morning') {
+      setMorningClicked(true);
+      try {
+        await AsyncStorage.setItem(`@morning_clicked_${todayStr}`, 'true');
+      } catch (err) {
+        console.warn(err);
+      }
+    } else if (shift === 'Evening') {
+      setEveningClicked(true);
+      try {
+        await AsyncStorage.setItem(`@evening_clicked_${todayStr}`, 'true');
+      } catch (err) {
+        console.warn(err);
+      }
+    }
+  };
+  
   // Inputs & captures state
   const [tempInput, setTempInput] = useState('');
   const [boxCountInput, setBoxCountInput] = useState('');
@@ -102,6 +214,9 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
   const [selectedReportDate, setSelectedReportDate] = useState(new Date().toISOString().split('T')[0]);
   const [showCalendarModal, setShowCalendarModal] = useState(false);
   const [showInventoryModal, setShowInventoryModal] = useState(false);
+  const [selectedInventoryItem, setSelectedInventoryItem] = useState(null);
+  const [showHistoryModal, setShowHistoryModal] = useState(false);
+  const [showNotificationsModal, setShowNotificationsModal] = useState(false);
   const [calendarMonth, setCalendarMonth] = useState(new Date());
   const [showClientDropdown, setShowClientDropdown] = useState(false);
   const [showChamberDropdown, setShowChamberDropdown] = useState(false);
@@ -132,6 +247,55 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
   const [overdueCount, setOverdueCount] = useState(0);
   const [syncStatus, setSyncStatus] = useState('idle'); // 'idle' | 'syncing'
   const [refreshing, setRefreshing] = useState(false);
+
+  const isMorningCompleted = useMemo(() => {
+    const activeAssignments = assignments.filter(item => item.status !== 'inactive');
+    if (activeAssignments.length === 0) return false;
+    
+    const todayStr = new Date().toISOString().split('T')[0];
+    const hasPendingMorning = activeAssignments.some(item => {
+      const log = completedLogs.find(l => 
+        l.chamber_id === item.chamber_id && 
+        l.client_name === item.client_name && 
+        l.entry_date === todayStr &&
+        l.entry_time === '10:00 AM'
+      );
+      return !log;
+    });
+    return !hasPendingMorning;
+  }, [assignments, completedLogs]);
+
+  const getActiveTasksDetails = () => {
+    const isEveningUnlocked = new Date().getHours() >= 16;
+    const activeAssignments = assignments.filter(item => item.status !== 'inactive');
+    const todayStr = new Date().toISOString().split('T')[0];
+    
+    // For Morning tasks (10:00 AM)
+    const completedMorningLogs = completedLogs.filter(log => log.entry_time === '10:00 AM' && log.entry_date === todayStr);
+    const pendingMorning = activeAssignments.filter(task => 
+      !completedMorningLogs.some(log => log.chamber_id === task.chamber_id && log.client_name === task.client_name)
+    );
+
+    // For Evening tasks (04:00 PM)
+    const completedEveningLogs = completedLogs.filter(log => log.entry_time === '04:00 PM' && log.entry_date === todayStr);
+    const pendingEvening = activeAssignments.filter(task => 
+      !completedEveningLogs.some(log => log.chamber_id === task.chamber_id && log.client_name === task.client_name)
+    );
+
+    return {
+      pendingMorning,
+      pendingEvening,
+      isEveningUnlocked
+    };
+  };
+
+  // Auto-switch activeShift to Evening if Morning tasks are completed and Evening is unlocked
+  useEffect(() => {
+    const isEveningUnlocked = new Date().getHours() >= 16;
+    if (isMorningCompleted && activeShift === 'Morning' && isEveningUnlocked) {
+      setActiveShift('Evening');
+    }
+  }, [isMorningCompleted, activeShift]);
 
   // Dimensions
   const { width } = useWindowDimensions();
@@ -680,7 +844,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
 
       if (activeTab === 'Pending') {
         const activeChamberTasks = chamberTasks.filter(t => t.status !== 'inactive');
-        return activeChamberTasks.length > 1 && chamberLogs.length < activeChamberTasks.length;
+        return chamberLogs.length > 0 && chamberLogs.length < activeChamberTasks.length;
       }
       if (activeTab === 'Completed') {
         return isCompleted;
@@ -710,7 +874,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
       shiftTasks.push({
         ...item,
         shift_time: '10:00 AM',
-        shift_label: 'Morning (10:00 AM)'
+        shift_label: 'Morning Task'
       });
       
       const currentHour = new Date().getHours();
@@ -718,7 +882,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
         shiftTasks.push({
           ...item,
           shift_time: '04:00 PM',
-          shift_label: 'Evening (04:00 PM)'
+          shift_label: 'Evening Task'
         });
       }
     });
@@ -980,54 +1144,66 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
           </Text>
           <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
             {/* Morning Shift Card */}
-            <TouchableOpacity
-              style={{
-                flex: 1,
-                backgroundColor: activeShift === 'Morning' ? '#eff6ff' : '#ffffff',
-                borderColor: activeShift === 'Morning' ? '#2563eb' : '#e2e8f0',
-                borderWidth: activeShift === 'Morning' ? 2 : 1,
-                borderRadius: 12,
-                padding: 12,
-                alignItems: 'center',
-                flexDirection: 'row',
-                marginRight: 6,
-                elevation: 1,
-                shadowColor: '#000',
-                shadowOffset: { width: 0, height: 1 },
-                shadowOpacity: 0.05,
-                shadowRadius: 2,
-              }}
-              activeOpacity={0.8}
-              onPress={() => setActiveShift('Morning')}
-            >
-              <View style={{ width: 32, height: 32, borderRadius: 16, backgroundColor: activeShift === 'Morning' ? '#2563eb' : '#f1f5f9', alignItems: 'center', justifyContent: 'center', marginRight: 8 }}>
-                <Ionicons name="sunny" size={16} color={activeShift === 'Morning' ? '#ffffff' : '#475569'} />
-              </View>
-              <View style={{ flex: 1 }}>
-                <Text style={{ fontSize: 13, fontWeight: '800', color: activeShift === 'Morning' ? '#1e3a8a' : '#334155' }}>
-                  Morning Shift
-                </Text>
-                <Text style={{ fontSize: 10, color: '#64748b', marginTop: 1, fontWeight: '600' }}>
-                  Target: 10:00 AM
-                </Text>
-              </View>
-            </TouchableOpacity>
+            {(() => {
+              const showMorningRed = activeShift !== 'Morning' && !morningClicked && !isMorningCompleted;
+              return (
+                <TouchableOpacity
+                  style={{
+                    flex: 1,
+                    backgroundColor: activeShift === 'Morning' ? '#eff6ff' : (isMorningCompleted ? '#f8fafc' : '#ffffff'),
+                    borderColor: activeShift === 'Morning' ? '#2563eb' : '#e2e8f0',
+                    borderWidth: activeShift === 'Morning' ? 1.5 : 1,
+                    borderRadius: 8,
+                    padding: 8,
+                    alignItems: 'center',
+                    flexDirection: 'row',
+                    marginRight: 4,
+                    elevation: 1,
+                    shadowColor: '#000',
+                    shadowOffset: { width: 0, height: 1 },
+                    shadowOpacity: 0.05,
+                    shadowRadius: 2,
+                    opacity: isMorningCompleted ? 0.6 : 1,
+                  }}
+                  disabled={isMorningCompleted}
+                  activeOpacity={0.8}
+                  onPress={() => handleSelectShift('Morning')}
+                >
+                  <View style={{ width: 26, height: 26, borderRadius: 13, backgroundColor: activeShift === 'Morning' ? '#2563eb' : '#f1f5f9', alignItems: 'center', justifyContent: 'center', marginRight: 6 }}>
+                    <Ionicons name="sunny" size={13} color={activeShift === 'Morning' ? '#ffffff' : '#475569'} />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ 
+                      fontSize: 11.5, 
+                      fontWeight: showMorningRed ? '900' : '800', 
+                      color: showMorningRed ? '#ef4444' : (activeShift === 'Morning' ? '#1e3a8a' : '#334155') 
+                    }}>
+                      Morning Task
+                    </Text>
+                    <Text style={{ fontSize: 8.5, color: isMorningCompleted ? '#16a34a' : '#64748b', marginTop: 0.5, fontWeight: '600' }}>
+                      {isMorningCompleted ? 'Completed' : 'Morning Slot'}
+                    </Text>
+                  </View>
+                </TouchableOpacity>
+              );
+            })()}
 
             {/* Evening Shift Card */}
             {(() => {
               const isEveningUnlocked = new Date().getHours() >= 16;
+              const showEveningRed = activeShift !== 'Evening' && isEveningUnlocked && !eveningClicked;
               return (
                 <TouchableOpacity
                   style={{
                     flex: 1,
                     backgroundColor: activeShift === 'Evening' ? '#eff6ff' : (isEveningUnlocked ? '#ffffff' : '#f8fafc'),
                     borderColor: activeShift === 'Evening' ? '#2563eb' : '#e2e8f0',
-                    borderWidth: activeShift === 'Evening' ? 2 : 1,
-                    borderRadius: 12,
-                    padding: 12,
+                    borderWidth: activeShift === 'Evening' ? 1.5 : 1,
+                    borderRadius: 8,
+                    padding: 8,
                     alignItems: 'center',
                     flexDirection: 'row',
-                    marginLeft: 6,
+                    marginLeft: 4,
                     opacity: isEveningUnlocked ? 1 : 0.7,
                     elevation: 1,
                     shadowColor: '#000',
@@ -1037,21 +1213,25 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                   }}
                   disabled={!isEveningUnlocked}
                   activeOpacity={0.8}
-                  onPress={() => setActiveShift('Evening')}
+                  onPress={() => handleSelectShift('Evening')}
                 >
-                  <View style={{ width: 32, height: 32, borderRadius: 16, backgroundColor: activeShift === 'Evening' ? '#2563eb' : '#f1f5f9', alignItems: 'center', justifyContent: 'center', marginRight: 8 }}>
+                  <View style={{ width: 26, height: 26, borderRadius: 13, backgroundColor: activeShift === 'Evening' ? '#2563eb' : '#f1f5f9', alignItems: 'center', justifyContent: 'center', marginRight: 6 }}>
                     <Ionicons 
                       name={isEveningUnlocked ? "moon" : "lock-closed"} 
-                      size={16} 
+                      size={13} 
                       color={activeShift === 'Evening' ? '#ffffff' : '#475569'} 
                     />
                   </View>
                   <View style={{ flex: 1 }}>
-                    <Text style={{ fontSize: 13, fontWeight: '800', color: activeShift === 'Evening' ? '#1e3a8a' : '#334155' }}>
-                      Evening Shift
+                    <Text style={{ 
+                      fontSize: 11.5, 
+                      fontWeight: showEveningRed ? '900' : '800', 
+                      color: showEveningRed ? '#ef4444' : (activeShift === 'Evening' ? '#1e3a8a' : '#334155') 
+                    }}>
+                      Evening Task
                     </Text>
-                    <Text style={{ fontSize: 10, color: '#64748b', marginTop: 1, fontWeight: '600' }}>
-                      {isEveningUnlocked ? 'Target: 04:00 PM' : 'Locks until 4:00 PM'}
+                    <Text style={{ fontSize: 8.5, color: '#64748b', marginTop: 0.5, fontWeight: '600' }}>
+                      {isEveningUnlocked ? 'Evening Slot' : 'Locks until evening'}
                     </Text>
                   </View>
                 </TouchableOpacity>
@@ -1086,7 +1266,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                 {assignments.filter(item => item.status !== 'inactive').length}
               </Text>
               <Text style={styles.metricLabel}>All Tasks</Text>
-              <Text style={styles.metricSubtitle}>Active Shift</Text>
+              <Text style={styles.metricSubtitle}>Active Task</Text>
             </TouchableOpacity>
 
             {/* 2. Pending Tasks Card (Yellow tint) */}
@@ -1168,6 +1348,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                   const details = getChamberDetails(chamber);
                   const chamberTasks = assignments.filter(item => item.chamber_id === chamber.id);
                   const completedChamberLogs = completedLogs.filter(log => log.chamber_id === chamber.id);
+                  const clientNames = Array.from(new Set(chamberTasks.map(t => t.client_name).filter(Boolean))).join(', ');
 
                   return (
                     <TouchableOpacity
@@ -1188,22 +1369,33 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                         setShowLogModal(true);
                       }}
                     >
-                      <View style={styles.chamberCardHeader}>
-                        <Ionicons name={details.icon} size={15} color={details.pillColor} style={{ marginRight: 5 }} />
-                        <Text style={styles.chamberCardName} numberOfLines={1}>{chamber.name}</Text>
+                      {/* Left: Chamber details */}
+                      <View style={{ flex: 1.5, alignItems: 'flex-start' }}>
+                        <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 4 }}>
+                          <Ionicons name={details.icon} size={14} color={details.pillColor} style={{ marginRight: 6 }} />
+                          <Text style={{ fontSize: 13, fontWeight: 'bold', color: '#1e293b' }}>{chamber.name}</Text>
+                        </View>
+                        <View style={[styles.typePill, { backgroundColor: details.pillBg, marginVertical: 0 }]}>
+                          <Text style={[styles.typePillText, { color: details.pillColor }]}>{details.type}</Text>
+                        </View>
                       </View>
 
-                      <Text style={styles.chamberCardTemp}>{details.displayTemp}</Text>
-
-                      <View style={[styles.typePill, { backgroundColor: details.pillBg }]}>
-                        <Text style={[styles.typePillText, { color: details.pillColor }]}>{details.type}</Text>
-                      </View>
-
-                      <View style={styles.statusIndicatorRow}>
-                        <View style={[styles.statusDot, { backgroundColor: details.statusColor }]} />
-                        <Text style={[styles.statusText, { color: details.statusColor }]}>
-                          {completedChamberLogs.length === chamberTasks.length ? 'Done' : 'Normal'}
+                      {/* Middle: Clients list */}
+                      <View style={{ flex: 2, paddingHorizontal: 12, borderLeftWidth: 1, borderRightWidth: 1, borderColor: '#e2e8f0' }}>
+                        <Text style={{ fontSize: 9, fontWeight: '700', color: '#94a3b8', textTransform: 'uppercase', marginBottom: 2 }}>Clients</Text>
+                        <Text style={{ fontSize: 12, fontWeight: '700', color: '#334155' }} numberOfLines={2}>
+                          {clientNames || 'No Clients'}
                         </Text>
+                      </View>
+
+                      {/* Right: Status indicator */}
+                      <View style={{ flex: 1, alignItems: 'flex-end', justifyContent: 'center' }}>
+                        <View style={[styles.statusIndicatorRow, { marginTop: 0 }]}>
+                          <View style={[styles.statusDot, { backgroundColor: details.statusColor }]} />
+                          <Text style={[styles.statusText, { color: details.statusColor, fontSize: 11 }]}>
+                            {completedChamberLogs.length === chamberTasks.length ? 'Done' : 'Normal'}
+                          </Text>
+                        </View>
                       </View>
                     </TouchableOpacity>
                   );
@@ -1246,7 +1438,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                   listItems.push({
                     ...item,
                     shift_time: '10:00 AM',
-                    shift_label: 'Morning (10:00 AM)'
+                    shift_label: 'Morning Task'
                   });
                   
                   const currentHour = new Date().getHours();
@@ -1254,7 +1446,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                     listItems.push({
                       ...item,
                       shift_time: '04:00 PM',
-                      shift_label: 'Evening (04:00 PM)'
+                      shift_label: 'Evening Task'
                     });
                   }
                 });
@@ -1298,7 +1490,10 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                             </View>
                           </View>
                           <Text style={[styles.taskClientMeta, { marginTop: 4 }]}>
-                            {isCompleted ? `Logged Temp: ${log?.box_temp}°C at ${log?.entry_time}` : 'Reading Pending'}
+                            {isCompleted 
+                              ? `Logged Temp: ${log?.box_temp}°C at ${log?.entry_time} | Ref: ${log?.reference_no || 'Pending Sync'}` 
+                              : 'Reading Pending'
+                            }
                           </Text>
                         </View>
                       </View>
@@ -1588,7 +1783,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                       <View style={{ flex: 1, paddingRight: 8 }}>
                         <Text style={styles.inventoryClientName}>{item.clientName}</Text>
                         <Text style={styles.inventoryChamberLabel}>
-                          {item.chamberName} • {item.chamberType}
+                          <Text style={{ fontWeight: 'bold', color: '#475569' }}>{item.chamberName}</Text> • {item.chamberType}
                         </Text>
                       </View>
                       <View style={styles.inventoryCountBadge}>
@@ -1613,12 +1808,34 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                     {/* Recent updates list */}
                     <View style={styles.inventoryHistoryList}>
                       <Text style={styles.historyListTitle}>Recent Logs History:</Text>
-                      {item.history.slice(0, 4).map((hist, hIdx) => (
+                      {item.history.slice(0, 3).map((hist, hIdx) => (
                         <View key={hIdx} style={styles.historyRow}>
                           <Text style={styles.historyDate}>{hist.date} ({hist.time})</Text>
                           <Text style={styles.historyBoxes}>{hist.boxCount} Boxes ({hist.temp}°C)</Text>
                         </View>
                       ))}
+                      
+                      <TouchableOpacity 
+                        style={{ 
+                          marginTop: 8, 
+                          flexDirection: 'row', 
+                          alignItems: 'center', 
+                          justifyContent: 'center', 
+                          backgroundColor: '#eff6ff', 
+                          borderColor: '#bfdbfe', 
+                          borderWidth: 1, 
+                          borderRadius: 8, 
+                          paddingVertical: 6,
+                          width: '100%'
+                        }}
+                        onPress={() => {
+                          setSelectedInventoryItem(item);
+                          setShowHistoryModal(true);
+                        }}
+                      >
+                        <Ionicons name="eye-outline" size={14} color="#1d4ed8" style={{ marginRight: 6 }} />
+                        <Text style={{ fontSize: 11, fontWeight: '700', color: "#1d4ed8" }}>View Full History</Text>
+                      </TouchableOpacity>
                     </View>
                   </View>
                 );
@@ -1630,12 +1847,278 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
     );
   };
 
+  const renderNotificationsModal = () => {
+    const { pendingMorning, pendingEvening, isEveningUnlocked } = getActiveTasksDetails();
+    const hasMorningPending = pendingMorning.length > 0;
+    const hasEveningPending = isEveningUnlocked && pendingEvening.length > 0;
+    const totalPendingCount = (hasMorningPending ? pendingMorning.length : 0) + (hasEveningPending ? pendingEvening.length : 0);
+
+    const today = new Date();
+    const dd = String(today.getDate()).padStart(2, '0');
+    const mm = String(today.getMonth() + 1).padStart(2, '0');
+    const yyyy = today.getFullYear();
+    const formattedDate = `${dd}/${mm}/${yyyy}`;
+
+    return (
+      <Modal
+        visible={showNotificationsModal}
+        animationType="slide"
+        transparent
+        onRequestClose={() => setShowNotificationsModal(false)}
+      >
+        <View style={[styles.modalOverlay, { justifyContent: 'flex-start' }]}>
+          <View style={[styles.modalContainer, { 
+            maxHeight: '85%', 
+            width: '100%', 
+            padding: 0, 
+            borderTopLeftRadius: 0, 
+            borderTopRightRadius: 0, 
+            borderBottomLeftRadius: 20, 
+            borderBottomRightRadius: 20 
+          }]}>
+            <View style={{ 
+              flexDirection: 'row', 
+              justifyContent: 'space-between', 
+              alignItems: 'center', 
+              paddingHorizontal: 20, 
+              paddingVertical: 18,
+              backgroundColor: '#003580',
+              borderBottomWidth: 1, 
+              borderColor: 'rgba(255, 255, 255, 0.1)' 
+            }}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                <Ionicons name="notifications" size={20} color="#ffffff" />
+                <Text style={{ fontSize: 16, fontWeight: '800', color: '#ffffff' }}>Notification Center</Text>
+              </View>
+              <TouchableOpacity onPress={() => setShowNotificationsModal(false)}>
+                <Ionicons name="close" size={24} color="#ffffff" />
+              </TouchableOpacity>
+            </View>
+
+            <ScrollView contentContainerStyle={{ padding: 12, backgroundColor: '#ffffff', paddingBottom: 20 }}>
+              {/* Morning Task Notification Card */}
+              <TouchableOpacity 
+                style={{
+                  backgroundColor: '#ffffff',
+                  borderRadius: 10,
+                  padding: 10,
+                  marginBottom: 8,
+                  borderLeftWidth: 3,
+                  borderColor: '#3b82f6',
+                  elevation: 1,
+                  shadowColor: '#000',
+                  shadowOffset: { width: 0, height: 1 },
+                  shadowOpacity: 0.05,
+                  shadowRadius: 2,
+                  width: '100%',
+                }}
+                activeOpacity={0.9}
+                onPress={() => {
+                  handleSelectShift('Morning');
+                  setShowNotificationsModal(false);
+                }}
+              >
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                  <Text style={{ fontSize: 9.5, fontWeight: '800', color: '#64748b' }}>
+                    Today's Task - {formattedDate}
+                  </Text>
+                  <View style={{ backgroundColor: '#eff6ff', padding: 3, borderRadius: 4 }}>
+                    <Ionicons name="sunny" size={12} color="#3b82f6" />
+                  </View>
+                </View>
+                
+                <Text style={{ fontSize: 11.5, fontWeight: '700', color: '#1e293b', lineHeight: 15, marginBottom: 4 }}>
+                  Morning Task: {pendingMorning.length > 0 
+                    ? `${pendingMorning.length} pending assignments.` 
+                    : 'All assignments completed.'
+                  }
+                </Text>
+
+                <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <Text style={{ fontSize: 9.5, color: '#3b82f6', fontWeight: '800' }}>
+                    {pendingMorning.length > 0 ? 'Click & Check ➔' : 'View Details ➔'}
+                  </Text>
+                  {pendingMorning.length > 0 && <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: '#3b82f6' }} />}
+                </View>
+              </TouchableOpacity>
+
+              {/* Evening Task Notification Card (Only show if Evening is active/unlocked) */}
+              {isEveningUnlocked && (
+                <TouchableOpacity 
+                  style={{
+                    backgroundColor: '#ffffff',
+                    borderRadius: 10,
+                    padding: 10,
+                    borderLeftWidth: 3,
+                    borderColor: '#f59e0b',
+                    elevation: 1,
+                    shadowColor: '#000',
+                    shadowOffset: { width: 0, height: 1 },
+                    shadowOpacity: 0.05,
+                    shadowRadius: 2,
+                    width: '100%',
+                  }}
+                  activeOpacity={0.9}
+                  onPress={() => {
+                    handleSelectShift('Evening');
+                    setShowNotificationsModal(false);
+                  }}
+                >
+                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                    <Text style={{ fontSize: 9.5, fontWeight: '800', color: '#64748b' }}>
+                      Today's Task - {formattedDate}
+                    </Text>
+                    <View style={{ backgroundColor: '#fef3c7', padding: 3, borderRadius: 4 }}>
+                      <Ionicons name="moon" size={12} color="#f59e0b" />
+                    </View>
+                  </View>
+                  
+                  <Text style={{ fontSize: 11.5, fontWeight: '700', color: '#1e293b', lineHeight: 15, marginBottom: 4 }}>
+                    Evening Task: {pendingEvening.length > 0 
+                      ? `${pendingEvening.length} pending assignments.` 
+                      : 'All assignments completed.'
+                    }
+                  </Text>
+
+                  <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <Text style={{ fontSize: 9.5, color: '#f59e0b', fontWeight: '800' }}>
+                      {pendingEvening.length > 0 ? 'Click & Check ➔' : 'View Details ➔'}
+                    </Text>
+                    {pendingEvening.length > 0 && <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: '#f59e0b' }} />}
+                  </View>
+                </TouchableOpacity>
+              )}
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+    );
+  };
+
+  const renderHistoryModal = () => {
+    if (!showHistoryModal || !selectedInventoryItem) return null;
+    
+    return (
+      <Modal 
+        visible={showHistoryModal} 
+        animationType="slide" 
+        transparent={false} 
+        onRequestClose={() => setShowHistoryModal(false)}
+      >
+        <SafeAreaView style={{ flex: 1, backgroundColor: '#f8fafc' }}>
+          {/* Header */}
+          <View style={{
+            height: 56,
+            backgroundColor: '#003580',
+            flexDirection: 'row',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            paddingHorizontal: 16,
+            elevation: 4,
+            shadowColor: '#000',
+            shadowOffset: { width: 0, height: 2 },
+            shadowOpacity: 0.1,
+            shadowRadius: 3
+          }}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1, marginRight: 8 }}>
+              <TouchableOpacity onPress={() => setShowHistoryModal(false)} style={{ marginRight: 12 }}>
+                <Ionicons name="arrow-back" size={24} color="#ffffff" />
+              </TouchableOpacity>
+              <View style={{ flex: 1 }}>
+                <Text style={{ fontSize: 15, fontWeight: 'bold', color: '#ffffff' }} numberOfLines={1}>
+                  {selectedInventoryItem.clientName}
+                </Text>
+                <Text style={{ fontSize: 10, color: '#93c5fd', marginTop: 1 }} numberOfLines={1}>
+                  History • <Text style={{ fontWeight: 'bold', color: '#ffffff' }}>{selectedInventoryItem.chamberName}</Text>
+                </Text>
+              </View>
+            </View>
+            <TouchableOpacity onPress={() => setShowHistoryModal(false)} style={{ padding: 4 }}>
+              <Ionicons name="close-circle" size={24} color="#ffffff" />
+            </TouchableOpacity>
+          </View>
+
+          {/* Content */}
+          <ScrollView contentContainerStyle={{ padding: 16, paddingBottom: 40 }} showsVerticalScrollIndicator={false}>
+            <View style={{ backgroundColor: '#ffffff', borderRadius: 12, padding: 16, borderWidth: 1, borderColor: '#e2e8f0', marginBottom: 16 }}>
+              <Text style={{ fontSize: 11, fontWeight: 'bold', color: '#64748b', textTransform: 'uppercase', marginBottom: 12 }}>
+                Client & Chamber Info
+              </Text>
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 8 }}>
+                <Text style={{ fontSize: 12, color: '#475569' }}>Client Name</Text>
+                <Text style={{ fontSize: 12, fontWeight: 'bold', color: '#0f172a' }}>{selectedInventoryItem.clientName}</Text>
+              </View>
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 8 }}>
+                <Text style={{ fontSize: 12, color: '#475569' }}>Chamber</Text>
+                <Text style={{ fontSize: 12, fontWeight: 'bold', color: '#0f172a' }}>{selectedInventoryItem.chamberName}</Text>
+              </View>
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 8 }}>
+                <Text style={{ fontSize: 12, color: '#475569' }}>Chamber Type</Text>
+                <Text style={{ fontSize: 12, fontWeight: 'bold', color: '#0f172a' }}>{selectedInventoryItem.chamberType}</Text>
+              </View>
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
+                <Text style={{ fontSize: 12, color: '#475569' }}>Current Stock</Text>
+                <Text style={{ fontSize: 12, fontWeight: 'bold', color: '#16a34a' }}>{selectedInventoryItem.currentCount} Boxes</Text>
+              </View>
+            </View>
+
+            <View style={{ backgroundColor: '#ffffff', borderRadius: 12, padding: 16, borderWidth: 1, borderColor: '#e2e8f0' }}>
+              <Text style={{ fontSize: 11, fontWeight: 'bold', color: '#64748b', textTransform: 'uppercase', marginBottom: 12 }}>
+                Inventory Log History
+              </Text>
+
+              {selectedInventoryItem.history.length === 0 ? (
+                <Text style={{ fontSize: 12, color: '#64748b', textAlign: 'center', marginVertical: 20 }}>
+                  No history records found.
+                </Text>
+              ) : (
+                selectedInventoryItem.history.map((hist, index) => (
+                  <View key={index}>
+                    <View style={{ paddingVertical: 12, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <View>
+                        <Text style={{ fontSize: 13, fontWeight: '700', color: '#1e293b' }}>{hist.date}</Text>
+                        <Text style={{ fontSize: 11, color: '#64748b', marginTop: 3 }}>
+                          Slot: {hist.time === '10:00 AM' ? 'Morning Task' : hist.time === '04:00 PM' ? 'Evening Task' : hist.time}
+                        </Text>
+                      </View>
+                      <View style={{ alignItems: 'flex-end' }}>
+                        <Text style={{ fontSize: 13, fontWeight: '800', color: '#0f172a' }}>{hist.boxCount} Boxes</Text>
+                        {hist.temp !== undefined && hist.temp !== null && (
+                          <Text style={{ fontSize: 11, color: '#475569', marginTop: 3 }}>Temp: {hist.temp}°C</Text>
+                        )}
+                      </View>
+                    </View>
+                    {index < selectedInventoryItem.history.length - 1 && (
+                      <View style={{ height: 1, backgroundColor: '#f1f5f9', marginVertical: 2 }} />
+                    )}
+                  </View>
+                ))
+              )}
+            </View>
+          </ScrollView>
+        </SafeAreaView>
+      </Modal>
+    );
+  };
+
   // C. REPORTS TAB VIEW
   const renderReportsView = () => {
     const allInspections = getAllLocalInspections();
-    const selectedDateLogs = allInspections.filter(log => log.entry_date === selectedReportDate);
+    
+    // Filter inspections: if search query is active, search globally across all dates.
+    // If search query is empty, show only for the selected report date.
+    const filteredLogs = allInspections.filter(log => {
+      if (reportSearchQuery.trim() !== '') {
+        const query = reportSearchQuery.toLowerCase().trim();
+        const clientMatch = log.client_name ? log.client_name.toLowerCase().includes(query) : false;
+        const chamberMatch = log.chamber_name ? log.chamber_name.toLowerCase().includes(query) : false;
+        const refMatch = log.reference_no ? log.reference_no.toLowerCase().includes(query) : false;
+        return clientMatch || chamberMatch || refMatch;
+      }
+      return log.entry_date === selectedReportDate;
+    });
 
-    const alertCount = selectedDateLogs.filter(log => {
+    const alertCount = filteredLogs.filter(log => {
       const pattern = getChamberTypeAndDefault(log.chamber_id);
       const checkType = log.chamber_type || pattern.type;
       if (checkType === 'Frozen') return log.box_temp > -18;
@@ -1644,8 +2127,8 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
       return false;
     }).length;
 
-    const complianceRate = selectedDateLogs.length > 0 
-      ? Math.round(((selectedDateLogs.length - alertCount) / selectedDateLogs.length) * 100) 
+    const complianceRate = filteredLogs.length > 0 
+      ? Math.round(((filteredLogs.length - alertCount) / filteredLogs.length) * 100) 
       : 100;
 
     return (
@@ -1655,7 +2138,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
           
           <View style={styles.statsMetricRow}>
             <View style={styles.statsBox}>
-              <Text style={styles.statsVal}>{selectedDateLogs.length}</Text>
+              <Text style={styles.statsVal}>{filteredLogs.length}</Text>
               <Text style={styles.statsLbl}>Total Logs</Text>
             </View>
             <View style={styles.statsBox}>
@@ -1692,8 +2175,10 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
 
         <View style={styles.alertLogsCard}>
           <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-            <Text style={[styles.alertLogsCardTitle, { marginBottom: 0 }]}>Logs ({selectedReportDate})</Text>
-            {selectedDateLogs.length > 0 && (
+            <Text style={[styles.alertLogsCardTitle, { marginBottom: 0 }]}>
+              Logs ({reportSearchQuery.trim() !== '' ? 'Search Results' : selectedReportDate})
+            </Text>
+            {filteredLogs.length > 0 && (
               <TouchableOpacity 
                 style={{ 
                   flexDirection: 'row', 
@@ -1710,13 +2195,45 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
               </TouchableOpacity>
             )}
           </View>
-          {selectedDateLogs.length === 0 ? (
+
+          {/* Search bar inside the logs panel */}
+          <View style={{ 
+            flexDirection: 'row', 
+            alignItems: 'center', 
+            backgroundColor: '#f1f5f9', 
+            borderRadius: 8, 
+            paddingHorizontal: 10, 
+            paddingVertical: 6,
+            marginBottom: 12,
+            borderWidth: 0.5,
+            borderColor: '#cbd5e1'
+          }}>
+            <Ionicons name="search-outline" size={16} color="#64748b" style={{ marginRight: 6 }} />
+            <TextInput
+              style={{ flex: 1, fontSize: 13, color: '#1e293b', padding: 0 }}
+              placeholder="Search by Client, Chamber or Ref No..."
+              placeholderTextColor="#94a3b8"
+              value={reportSearchQuery}
+              onChangeText={setReportSearchQuery}
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+            {reportSearchQuery !== '' && (
+              <TouchableOpacity onPress={() => setReportSearchQuery('')}>
+                <Ionicons name="close-circle" size={18} color="#94a3b8" />
+              </TouchableOpacity>
+            )}
+          </View>
+
+          {filteredLogs.length === 0 ? (
             <View style={styles.reportsEmptyRow}>
               <Ionicons name="clipboard-outline" size={24} color="#94a3b8" />
-              <Text style={styles.reportsEmptyText}>No inspection logs recorded on this date.</Text>
+              <Text style={styles.reportsEmptyText}>
+                {reportSearchQuery.trim() !== '' ? 'No records match search query.' : 'No inspection logs recorded on this date.'}
+              </Text>
             </View>
           ) : (
-            selectedDateLogs.map(log => {
+            filteredLogs.map(log => {
               const pattern = getChamberTypeAndDefault(log.chamber_id);
               const checkType = log.chamber_type || pattern.type;
               
@@ -1728,9 +2245,14 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
               return (
                 <View key={log.id} style={styles.alertLogItem}>
                   <View style={{ flex: 1 }}>
-                    <Text style={styles.alertLogClient}>{log.client_name}</Text>
+                    <Text style={styles.alertLogClient}>
+                      {log.client_name}
+                    </Text>
+                    <Text style={{ fontSize: 9.5, fontWeight: '700', color: log.reference_no ? '#0f766e' : '#b45309', marginVertical: 2 }}>
+                      {log.reference_no ? `Ref: ${log.reference_no}` : 'Ref: [Pending Sync]'}
+                    </Text>
                     <Text style={styles.alertLogMeta}>
-                      {log.chamber_name} ({checkType}) | Time: {log.entry_time}
+                      {log.chamber_name} ({checkType}) | Time: {log.entry_time} | Date: {log.entry_date}
                     </Text>
                     <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 4 }}>
                       <Text style={{ fontSize: 10, color: log.sync_status === 'synced' ? '#16a34a' : '#c2410c', fontWeight: 'bold' }}>
@@ -1743,7 +2265,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                       )}
                     </View>
                   </View>
-                  <View style={{ alignItems: 'flex-end' }}>
+                  <View style={{ alignItems: 'flex-end', justifyContent: 'center' }}>
                     <Text style={[styles.alertLogTemp, { color: isCompliant ? '#16a34a' : '#ef4444' }]}>
                       {log.box_temp}°C
                     </Text>
@@ -2098,7 +2620,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
 
                 {/* Shift Selector */}
                 <View style={{ marginBottom: 12 }}>
-                  <Text style={styles.modalLabel}>Shift Time (Task Slot)</Text>
+                  <Text style={styles.modalLabel}>Task Time (Task Slot)</Text>
                   {isProfileEditable ? (
                     <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 4 }}>
                       <TouchableOpacity 
@@ -2127,44 +2649,51 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                           fontWeight: '700', 
                           color: selectedShift === '10:00 AM' ? '#003580' : '#64748b' 
                         }}>
-                          Morning (10:00 AM)
+                           Morning Task
                         </Text>
                       </TouchableOpacity>
 
-                      <TouchableOpacity 
-                        style={{
-                          flex: 1,
-                          flexDirection: 'row',
-                          alignItems: 'center',
-                          justifyContent: 'center',
-                          paddingVertical: 10,
-                          borderRadius: 8,
-                          borderWidth: 1.5,
-                          borderColor: selectedShift === '04:00 PM' ? '#003580' : '#e2e8f0',
-                          backgroundColor: selectedShift === '04:00 PM' ? '#f0f4f8' : '#ffffff',
-                          marginLeft: 5
-                        }}
-                        onPress={() => setSelectedShift('04:00 PM')}
-                      >
-                        <Ionicons 
-                          name={selectedShift === '04:00 PM' ? 'radio-button-on' : 'radio-button-off'} 
-                          size={16} 
-                          color={selectedShift === '04:00 PM' ? '#003580' : '#64748b'} 
-                          style={{ marginRight: 6 }}
-                        />
-                        <Text style={{ 
-                          fontSize: 13, 
-                          fontWeight: '700', 
-                          color: selectedShift === '04:00 PM' ? '#003580' : '#64748b' 
-                        }}>
-                          Evening (04:00 PM)
-                        </Text>
-                      </TouchableOpacity>
+                      {(() => {
+                        const isEveningUnlocked = new Date().getHours() >= 16;
+                        return (
+                          <TouchableOpacity 
+                            style={{
+                              flex: 1,
+                              flexDirection: 'row',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              paddingVertical: 10,
+                              borderRadius: 8,
+                              borderWidth: 1.5,
+                              borderColor: selectedShift === '04:00 PM' ? '#003580' : '#e2e8f0',
+                              backgroundColor: selectedShift === '04:00 PM' ? '#f0f4f8' : (isEveningUnlocked ? '#ffffff' : '#f8fafc'),
+                              marginLeft: 5,
+                              opacity: isEveningUnlocked ? 1 : 0.6
+                            }}
+                            disabled={!isEveningUnlocked}
+                            onPress={() => setSelectedShift('04:00 PM')}
+                          >
+                            <Ionicons 
+                              name={selectedShift === '04:00 PM' ? 'radio-button-on' : 'radio-button-off'} 
+                              size={16} 
+                              color={selectedShift === '04:00 PM' ? '#003580' : '#64748b'} 
+                              style={{ marginRight: 6 }}
+                            />
+                            <Text style={{ 
+                              fontSize: 13, 
+                              fontWeight: '700', 
+                              color: selectedShift === '04:00 PM' ? '#003580' : '#64748b' 
+                            }}>
+                               Evening Task
+                            </Text>
+                          </TouchableOpacity>
+                        );
+                      })()}
                     </View>
                   ) : (
                     <View style={styles.readOnlyField}>
                       <Text style={styles.readOnlyText}>
-                        {logEntryTime === '10:00 AM' ? 'Morning Shift (10:00 AM)' : logEntryTime === '04:00 PM' ? 'Evening Shift (04:00 PM)' : `Shift: ${logEntryTime}`}
+                        {logEntryTime === '10:00 AM' ? 'Morning Task' : logEntryTime === '04:00 PM' ? 'Evening Task' : 'Task Slot'}
                       </Text>
                     </View>
                   )}
@@ -3234,7 +3763,31 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
               <Ionicons name="sync-outline" size={22} color="#ffffff" style={{ marginRight: 12 }} />
             </TouchableOpacity>
           )}
-          <Ionicons name="happy" size={24} color="#ffffff" />
+          {(() => {
+            const { pendingMorning, pendingEvening, isEveningUnlocked } = getActiveTasksDetails();
+            const hasMorningPending = pendingMorning.length > 0;
+            const hasEveningPending = isEveningUnlocked && pendingEvening.length > 0;
+            const totalPendingCount = (hasMorningPending ? pendingMorning.length : 0) + (hasEveningPending ? pendingEvening.length : 0);
+
+            return (
+              <TouchableOpacity onPress={() => setShowNotificationsModal(true)} style={{ position: 'relative' }}>
+                <Ionicons name="notifications-outline" size={24} color="#ffffff" />
+                 {totalPendingCount > 0 && (
+                  <View style={{
+                    position: 'absolute',
+                    top: 1,
+                    right: 2,
+                    backgroundColor: '#ef4444',
+                    borderRadius: 4,
+                    width: 8,
+                    height: 8,
+                    borderWidth: 1.2,
+                    borderColor: '#003580'
+                  }} />
+                )}
+              </TouchableOpacity>
+            );
+          })()}
         </View>
       </View>
 
@@ -3253,6 +3806,8 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
       {renderSubmitConfirmModal()}
       {renderDrawerModal()}
       {renderInventoryModal()}
+      {renderHistoryModal()}
+      {renderNotificationsModal()}
 
       {/* Navigation Tab Bar Overlay */}
       {renderBottomTabBar()}
@@ -3299,72 +3854,72 @@ const styles = StyleSheet.create({
   // Welcome Greetings Card
   welcomeCard: {
     backgroundColor: '#0a1128', 
-    borderRadius: 20,
-    padding: 16,
+    borderRadius: 12,
+    padding: 10,
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 14,
-    elevation: 3,
+    marginBottom: 10,
+    elevation: 2,
     shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.15,
-    shadowRadius: 5,
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.1,
+    shadowRadius: 3,
   },
   welcomeInfo: {
     flex: 1,
-    marginRight: 8,
+    marginRight: 6,
   },
   welcomeText: {
-    fontSize: 19,
+    fontSize: 14.5,
     fontWeight: 'bold',
     color: '#ffffff',
-    letterSpacing: 0.3,
+    letterSpacing: 0.2,
   },
   roleText: {
-    fontSize: 13,
+    fontSize: 11,
     color: '#94a3b8', 
-    marginTop: 2,
+    marginTop: 1,
     fontWeight: '500',
   },
   warehouseRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginTop: 18,
+    marginTop: 8,
   },
   warehouseText: {
-    fontSize: 12,
+    fontSize: 10.5,
     color: '#93c5fd', 
     fontWeight: 'bold',
-    marginLeft: 6,
+    marginLeft: 5,
   },
   dateContainer: {
     backgroundColor: '#ffffff', 
-    borderRadius: 14,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
     alignItems: 'center',
-    width: 130,
-    minHeight: 85,
+    width: 105,
+    minHeight: 65,
     justifyContent: 'center',
   },
   dateText: {
-    fontSize: 12,
+    fontSize: 10,
     fontWeight: 'bold',
     color: '#0f172a',
   },
   dateSub: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginVertical: 4,
+    marginVertical: 2,
   },
   dayText: {
-    fontSize: 10,
+    fontSize: 8.5,
     color: '#64748b',
     fontWeight: '500',
   },
   timeText: {
-    fontSize: 12,
+    fontSize: 10,
     fontWeight: 'bold',
     color: '#003580', 
   },
@@ -3519,21 +4074,21 @@ const styles = StyleSheet.create({
 
   // 2-column chambers grid layout
   chambersGrid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    justifyContent: 'space-between',
+    flexDirection: 'column',
     paddingVertical: 8,
     width: '100%',
   },
   chamberCard: {
-    width: '48.5%',
+    width: '100%',
     backgroundColor: '#ffffff',
     borderRadius: 14,
     borderWidth: 1.2,
     borderColor: '#e2e8f0', 
     padding: 14,
-    marginBottom: 12,
+    marginBottom: 10,
+    flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'space-between',
     elevation: 2,
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 1 },
@@ -3556,11 +4111,16 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     color: '#64748b',
   },
-  chamberCardTemp: {
-    fontSize: 22,
+  chamberCardClients: {
+    fontSize: 12,
     fontWeight: 'bold',
     color: '#0f172a',
     marginVertical: 4,
+    textAlign: 'center',
+    height: 32,
+    lineHeight: 16,
+    width: '100%',
+    paddingHorizontal: 4,
   },
   typePill: {
     paddingHorizontal: 12,

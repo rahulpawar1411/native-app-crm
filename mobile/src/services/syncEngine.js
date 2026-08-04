@@ -74,12 +74,12 @@ export const triggerSync = async (apiBaseUrl, token, onSyncProgress = () => {}) 
 
         // 201 Created or 200 OK means sync successful
         if (response.status === 200 || response.status === 201) {
-          markInspectionAsSynced(log.id);
+          markInspectionAsSynced(log.id, resData.reference_no);
         } 
         // 409 Conflict means duplicate entry exists on backend; mark synced locally so queue is not blocked
         else if (response.status === 409) {
           console.warn(`⚠️ Sync Warning: Duplicate found on server. Clearing log ID: ${log.id}`);
-          markInspectionAsSynced(log.id);
+          markInspectionAsSynced(log.id, resData.reference_no);
         } else {
           throw new Error(resData.message || 'Sync request failed with status ' + response.status);
         }
