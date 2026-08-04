@@ -48,7 +48,7 @@ export const triggerSync = async (apiBaseUrl, token, onSyncProgress = () => {}) 
         if (log.photo_capture_time) {
           formData.append('photo_capture_time', log.photo_capture_time);
         }
-        formData.append('shift', log.shift || (log.entry_time === '10:00 AM' ? 'Morning' : 'Evening'));
+        formData.append('shift', log.shift || (log.entry_time === '10:00' ? 'Morning' : 'Evening'));
 
         // Append photo file
         if (log.photo_uri) {

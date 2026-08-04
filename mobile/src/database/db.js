@@ -218,9 +218,12 @@ export const checkDuplicateInspection = (date, chamberId, clientName, entryTime)
 /**
  * Fetches all local inspections pending sync.
  */
-export const getPendingInspections = () => {
+export const getPendingInspections = (operatorName) => {
   if (!db) return [];
   try {
+    if (operatorName) {
+      return db.getAllSync("SELECT * FROM local_inspections WHERE sync_status = 'pending' AND operator_name = ?;", [operatorName]);
+    }
     return db.getAllSync("SELECT * FROM local_inspections WHERE sync_status = 'pending';");
   } catch (error) {
     console.error('❌ Failed to fetch pending sync inspections:', error);
@@ -231,9 +234,12 @@ export const getPendingInspections = () => {
 /**
  * Fetches all local inspections logged for today.
  */
-export const getTodaysInspections = (date) => {
+export const getTodaysInspections = (date, operatorName) => {
   if (!db) return [];
   try {
+    if (operatorName) {
+      return db.getAllSync("SELECT * FROM local_inspections WHERE entry_date = ? AND operator_name = ?;", [date, operatorName]);
+    }
     return db.getAllSync("SELECT * FROM local_inspections WHERE entry_date = ?;", [date]);
   } catch (error) {
     console.error('❌ Failed to fetch today\'s inspections:', error);
@@ -244,9 +250,12 @@ export const getTodaysInspections = (date) => {
 /**
  * Fetches all local inspections logged on the device.
  */
-export const getAllLocalInspections = () => {
+export const getAllLocalInspections = (operatorName) => {
   if (!db) return [];
   try {
+    if (operatorName) {
+      return db.getAllSync("SELECT * FROM local_inspections WHERE operator_name = ?;", [operatorName]);
+    }
     return db.getAllSync("SELECT * FROM local_inspections;");
   } catch (error) {
     console.error('❌ Failed to fetch all inspections:', error);
@@ -273,16 +282,16 @@ export const markInspectionAsSynced = (id, referenceNo) => {
 };
 
 /**
- * Deletes a local inspection by entry_date, chamber_id, client_name, and entry_time.
+ * Deletes a local inspection by entry_date, chamber_id, client_name, and shift.
  */
-export const deleteInspectionLocally = (date, chamberId, clientName, entryTime) => {
+export const deleteInspectionLocally = (date, chamberId, clientName, shift) => {
   if (!db) return false;
   try {
     db.runSync(
-      "DELETE FROM local_inspections WHERE entry_date = ? AND chamber_id = ? AND client_name = ? AND entry_time = ?;",
-      [date, parseInt(chamberId), clientName, entryTime]
+      "DELETE FROM local_inspections WHERE entry_date = ? AND chamber_id = ? AND client_name = ? AND shift = ?;",
+      [date, parseInt(chamberId), clientName, shift]
     );
-    console.log(`🗑️ Deleted local inspection: ${clientName} in Chamber ${chamberId} for date ${date} at ${entryTime}`);
+    console.log(`🗑️ Deleted local inspection: ${clientName} in Chamber ${chamberId} for date ${date} for shift ${shift}`);
     return true;
   } catch (error) {
     console.error('❌ Failed to delete local inspection:', error);

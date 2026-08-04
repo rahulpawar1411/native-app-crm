@@ -11,7 +11,8 @@ import {
   Platform,
   ScrollView,
   StatusBar,
-  useWindowDimensions
+  useWindowDimensions,
+  Alert
 } from 'react-native';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 
@@ -29,12 +30,14 @@ import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
  *   to quickly toggle between user personas.
  * ====================================================================
  */
-export default function LoginScreen({ onLoginSuccess, apiUrl }) {
+export default function LoginScreen({ onLoginSuccess, apiUrl, onUpdateApiUrl }) {
   // Input form state variables
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [secureTextEntry, setSecureTextEntry] = useState(true);
   const [loading, setLoading] = useState(false);
+  const [apiUrlInput, setApiUrlInput] = useState(apiUrl);
+  const [showSettings, setShowSettings] = useState(false);
 
   // Responsive layout scaling triggers
   const { width, height } = useWindowDimensions();
@@ -77,32 +80,16 @@ export default function LoginScreen({ onLoginSuccess, apiUrl }) {
         alert(data.message || 'Login failed. Please check your credentials.');
       }
     } catch (err) {
-      console.warn('⚠️ Server unreachable. Falling back to offline development mock login.', err.message);
+      console.warn('⚠️ Server unreachable:', err.message);
       
-      const emailLower = loginEmail.trim().toLowerCase();
-      if (emailLower.includes('admin') || emailLower.includes('subadmin')) {
-        alert('Access Denied: Only Data Operators registered in the directory are allowed to log in.');
-        setLoading(false);
-        return;
-      }
-
-      let role = 'do_operator';
-      let fullName = 'Test DO Operator (Offline)';
-      let warehouseName = 'Bengaluru';
-      let chamberLimit = 4;
-
-      onLoginSuccess({
-        user: {
-          id: 999,
-          email: emailLower,
-          role: role,
-          full_name: fullName,
-          phone_no: '9876543210',
-          warehouse_name: warehouseName,
-          chamber_limit: chamberLimit
-        },
-        token: 'mock-development-bypass-jwt-token'
-      });
+      Alert.alert(
+        'Connection Error',
+        `Could not reach the server at:\n${apiUrl}\n\nPlease check your internet connection or configure the correct Server Connection URL below.`,
+        [
+          { text: 'Configure Server', onPress: () => setShowSettings(true) },
+          { text: 'OK' }
+        ]
+      );
     } finally {
       setLoading(false);
     }
@@ -121,30 +108,7 @@ export default function LoginScreen({ onLoginSuccess, apiUrl }) {
     performLogin(email, password);
   };
 
-  /**
-   * Helper function for rapid QA testing. Auto-fills credentials
-   * and logs in with targeted role parameters.
-   * @param {string} role - Selected user persona ('Operator', 'Supervisor', 'Customer')
-   */
-  const handleQuickLogin = (role) => {
-    let testEmail = '';
-    let testPass = '';
 
-    if (role === 'Operator') {
-      testEmail = 'r@g.com';
-      testPass = 'qwe123';
-    } else if (role === 'Supervisor') {
-      testEmail = 'admin@reeferon.com';
-      testPass = 'admin123';
-    } else {
-      testEmail = 'subadmin@reeferon.com';
-      testPass = 'subadmin123';
-    }
-
-    setEmail(testEmail);
-    setPassword(testPass);
-    performLogin(testEmail, testPass);
-  };
 
   return (
     <KeyboardAvoidingView
@@ -166,7 +130,7 @@ export default function LoginScreen({ onLoginSuccess, apiUrl }) {
           source={require('../../assets/warehouse_bg.png')}
           style={[
             styles.headerBackground,
-            { height: height * 0.28 }
+            { height: height * 0.35 }
           ]}
           resizeMode="cover"
         >
@@ -250,39 +214,39 @@ export default function LoginScreen({ onLoginSuccess, apiUrl }) {
             </View>
           </TouchableOpacity>
 
-          {/* Persona selector divider */}
-          <View style={styles.dividerContainer}>
-            <View style={styles.dividerLine} />
-            <Text style={styles.dividerText}>or continue as</Text>
-            <View style={styles.dividerLine} />
-          </View>
 
-          {/* Quick Login selector cards (for dev testing) */}
-          <View style={styles.quickLoginContainer}>
-            <TouchableOpacity
-              style={styles.quickLoginCard}
-              onPress={() => handleQuickLogin('Operator')}
-            >
-              <MaterialCommunityIcons name="account-cog" size={20} color="#0033a0" />
-              <Text style={[styles.quickLoginText, { color: '#0033a0' }]} numberOfLines={1}>Operator</Text>
-            </TouchableOpacity>
 
-            <TouchableOpacity
-              style={styles.quickLoginCard}
-              onPress={() => handleQuickLogin('Supervisor')}
-            >
-              <MaterialCommunityIcons name="shield-account" size={20} color="#16a34a" />
-              <Text style={[styles.quickLoginText, { color: '#16a34a' }]} numberOfLines={1}>Supervisor</Text>
-            </TouchableOpacity>
+          {/* Collapsible Server Connection Settings */}
+          <TouchableOpacity 
+            onPress={() => setShowSettings(!showSettings)} 
+            style={{ alignSelf: 'center', marginVertical: 12, display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 4 }}
+          >
+            <Ionicons name={showSettings ? "chevron-up" : "settings-outline"} size={12} color="#0033a0" />
+            <Text style={{ color: '#0033a0', fontSize: 11, fontWeight: '700', textDecorationLine: 'underline' }}>
+              {showSettings ? 'Hide Connection Settings' : 'Configure Server Connection'}
+            </Text>
+          </TouchableOpacity>
 
-            <TouchableOpacity
-              style={styles.quickLoginCard}
-              onPress={() => handleQuickLogin('Customer')}
-            >
-              <MaterialCommunityIcons name="account-tie" size={20} color="#7c3aed" />
-              <Text style={[styles.quickLoginText, { color: '#7c3aed' }]} numberOfLines={1}>Customer</Text>
-            </TouchableOpacity>
-          </View>
+          {showSettings && (
+            <View style={{ marginBottom: 12 }}>
+              <Text style={styles.inputLabel}>Server Connection URL</Text>
+              <View style={styles.inputWrapper}>
+                <Ionicons name="server-outline" size={18} color="#94a3b8" style={styles.inputIcon} />
+                <TextInput
+                  style={styles.input}
+                  placeholder="https://your-backend.up.railway.app"
+                  placeholderTextColor="#94a3b8"
+                  value={apiUrlInput}
+                  onChangeText={(txt) => {
+                    setApiUrlInput(txt);
+                    onUpdateApiUrl(txt);
+                  }}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                />
+              </View>
+            </View>
+          )}
 
           <Text style={styles.version}>v1.0.0</Text>
         </View>
@@ -351,7 +315,8 @@ const styles = StyleSheet.create({
     borderTopRightRadius: 32,
     marginTop: -25, // overlaps the image nicely
     paddingHorizontal: 24,
-    paddingBottom: 16,
+    paddingTop: 24,
+    paddingBottom: Platform.OS === 'ios' ? 40 : 30,
   },
   sheetHandle: {
     width: 36,
@@ -363,21 +328,21 @@ const styles = StyleSheet.create({
     marginBottom: 12,
   },
   logo: {
-    width: 120,
-    height: 45,
+    width: 176,
+    height: 66,
     alignSelf: 'center',
-    marginBottom: 12,
+    marginBottom: 18,
   },
   welcomeBack: {
     fontSize: 22,
     fontWeight: '800',
     color: '#0f172a',
-    marginBottom: 2,
+    marginBottom: 6,
   },
   formSubtitle: {
     fontSize: 13,
     color: '#64748b',
-    marginBottom: 16,
+    marginBottom: 24,
   },
   inputLabel: {
     fontSize: 13,
@@ -393,7 +358,7 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     paddingHorizontal: 14,
     height: 48,
-    marginBottom: 10,
+    marginBottom: 16,
     backgroundColor: '#f8fafc',
   },
   inputIcon: {
@@ -410,7 +375,7 @@ const styles = StyleSheet.create({
   },
   forgotPassword: {
     alignSelf: 'flex-end',
-    marginBottom: 16,
+    marginBottom: 24,
   },
   forgotPasswordText: {
     color: '#0056b3',
@@ -423,7 +388,7 @@ const styles = StyleSheet.create({
     height: 48,
     alignItems: 'center',
     justifyContent: 'center',
-    marginBottom: 16,
+    marginBottom: 24,
   },
   signInButtonContent: {
     flexDirection: 'row',

@@ -15,7 +15,8 @@ import {
   Image,
   ActivityIndicator,
   RefreshControl,
-  Share
+  Share,
+  Animated
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import * as FileSystem from 'expo-file-system';
@@ -93,13 +94,13 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
   // Completed Log Metadata for read-only view
   const [logOperatorName, setLogOperatorName] = useState('');
   const [logSyncStatus, setLogSyncStatus] = useState('');
-  const [logEntryDate, setLogEntryDate] = useState('');
   const [logEntryTime, setLogEntryTime] = useState('');
+  const [logShift, setLogShift] = useState('');
 
   // IP Edit Modal States
   const [showIpEditModal, setShowIpEditModal] = useState(false);
   const [ipInput, setIpInput] = useState(apiUrl);
-  const [selectedShift, setSelectedShift] = useState('10:00 AM');
+  const [selectedShift, setSelectedShift] = useState('10:00');
   const [activeShift, setActiveShift] = useState(new Date().getHours() >= 16 ? 'Evening' : 'Morning');
   
   // Clicked tracking states for red notification
@@ -211,6 +212,27 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
   const [showSubmitConfirmModal, setShowSubmitConfirmModal] = useState(false);
   const [isLoadingData, setIsLoadingData] = useState(true);
   const [showDrawer, setShowDrawer] = useState(false);
+  const drawerAnim = React.useRef(new Animated.Value(-280)).current;
+
+  useEffect(() => {
+    if (showDrawer) {
+      Animated.timing(drawerAnim, {
+        toValue: 0,
+        duration: 250,
+        useNativeDriver: true,
+      }).start();
+    }
+  }, [showDrawer]);
+
+  const closeDrawer = () => {
+    Animated.timing(drawerAnim, {
+      toValue: -280,
+      duration: 200,
+      useNativeDriver: true,
+    }).start(() => {
+      setShowDrawer(false);
+    });
+  };
   const [selectedReportDate, setSelectedReportDate] = useState(new Date().toISOString().split('T')[0]);
   const [showCalendarModal, setShowCalendarModal] = useState(false);
   const [showInventoryModal, setShowInventoryModal] = useState(false);
@@ -258,7 +280,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
         l.chamber_id === item.chamber_id && 
         l.client_name === item.client_name && 
         l.entry_date === todayStr &&
-        l.entry_time === '10:00 AM'
+        l.shift === 'Morning'
       );
       return !log;
     });
@@ -270,14 +292,14 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
     const activeAssignments = assignments.filter(item => item.status !== 'inactive');
     const todayStr = new Date().toISOString().split('T')[0];
     
-    // For Morning tasks (10:00 AM)
-    const completedMorningLogs = completedLogs.filter(log => log.entry_time === '10:00 AM' && log.entry_date === todayStr);
+    // For Morning tasks
+    const completedMorningLogs = completedLogs.filter(log => log.shift === 'Morning' && log.entry_date === todayStr);
     const pendingMorning = activeAssignments.filter(task => 
       !completedMorningLogs.some(log => log.chamber_id === task.chamber_id && log.client_name === task.client_name)
     );
 
-    // For Evening tasks (04:00 PM)
-    const completedEveningLogs = completedLogs.filter(log => log.entry_time === '04:00 PM' && log.entry_date === todayStr);
+    // For Evening tasks
+    const completedEveningLogs = completedLogs.filter(log => log.shift === 'Evening' && log.entry_date === todayStr);
     const pendingEvening = activeAssignments.filter(task => 
       !completedEveningLogs.some(log => log.chamber_id === task.chamber_id && log.client_name === task.client_name)
     );
@@ -314,13 +336,9 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
       const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
       setCurrentDayStr(days[now.getDay()]);
 
-      let hours = now.getHours();
+      const hoursStr = String(now.getHours()).padStart(2, '0');
       const minutes = String(now.getMinutes()).padStart(2, '0');
-      const ampm = hours >= 12 ? 'PM' : 'AM';
-      hours = hours % 12;
-      hours = hours ? hours : 12;
-      const hoursStr = String(hours).padStart(2, '0');
-      setCurrentTime(`${hoursStr}:${minutes} ${ampm}`);
+      setCurrentTime(`${hoursStr}:${minutes}`);
     };
 
     updateDateTime();
@@ -361,14 +379,14 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
   // Pre-select shift based on active shift filter when modal opens in editable mode
   useEffect(() => {
     if (showLogModal && isProfileEditable) {
-      setSelectedShift(activeShift === 'Morning' ? '10:00 AM' : '04:00 PM');
+      setSelectedShift(activeShift === 'Morning' ? '10:00' : '16:00');
     }
   }, [showLogModal, isProfileEditable, activeShift]);
 
   // Recalculate pending tasks count whenever activeShift, completedLogs or assignments change
   useEffect(() => {
     const todayStr = new Date().toISOString().split('T')[0];
-    const targetShiftTime = activeShift === 'Morning' ? '10:00 AM' : '04:00 PM';
+    const targetShiftTime = activeShift === 'Morning' ? '10:00' : '16:00';
     const activeAssignmentsToday = assignments.filter(item => item.status !== 'inactive');
 
     const pendingTasksList = activeAssignmentsToday.filter(item => {
@@ -426,6 +444,16 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
           'Authorization': `Bearer ${token}`
         }
       });
+
+      if (response.status === 401 || response.status === 403) {
+        Alert.alert(
+          'Session Revoked',
+          'Your account has been deleted or disabled. Logging you out.',
+          [{ text: 'OK', onPress: onLogout }]
+        );
+        return;
+      }
+
       const data = await response.json();
       
       if (data.success && data.data) {
@@ -462,10 +490,10 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
   const loadInspectionsAndSummary = (currAssignments = assignments, currChambers = chambersList) => {
     const todayStr = new Date().toISOString().split('T')[0];
     
-    const todaysInspections = getTodaysInspections(todayStr);
+    const todaysInspections = getTodaysInspections(todayStr, displayName);
     setCompletedLogs(todaysInspections);
 
-    const pendingInspections = getPendingInspections();
+    const pendingInspections = getPendingInspections(displayName);
     setUnsyncedLogs(pendingInspections);
 
     // Active assignments today (excluding soft-deleted / inactive ones)
@@ -475,9 +503,9 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
     const currentHour = new Date().getHours();
     const activeShiftTasks = [];
     activeAssignmentsToday.forEach(item => {
-      activeShiftTasks.push({ ...item, shift_time: '10:00 AM' });
+      activeShiftTasks.push({ ...item, shift_time: '10:00' });
       if (currentHour >= 16) {
-        activeShiftTasks.push({ ...item, shift_time: '04:00 PM' });
+        activeShiftTasks.push({ ...item, shift_time: '16:00' });
       }
     });
 
@@ -485,7 +513,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
       const log = todaysInspections.find(l => 
         l.chamber_id === item.chamber_id && 
         l.client_name === item.client_name &&
-        l.entry_time === item.shift_time
+        l.shift === (item.shift_time === '10:00' ? 'Morning' : 'Evening')
       );
       const isCompleted = !!log;
       if (isCompleted) return false;
@@ -496,7 +524,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
     setPendingCount(pendingTasksList.length);
 
     // Calculate Overdue tasks for the past 5 days
-    const allInspections = getAllLocalInspections();
+    const allInspections = getAllLocalInspections(displayName);
     
     const getPastDates = (numDays) => {
       const dates = [];
@@ -648,10 +676,17 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
 
     const todayStr = new Date().toISOString().split('T')[0];
     const targetDate = selectedTaskDueDate || todayStr;
-    const timeStr = selectedShift;
+    
+    // Save the actual current submission time in HH:mm 24-hour format
+    const nowTime = new Date();
+    const hh = String(nowTime.getHours()).padStart(2, '0');
+    const min = String(nowTime.getMinutes()).padStart(2, '0');
+    const timeStr = `${hh}:${min}`;
+
+    const targetShiftName = selectedShift === '10:00' ? 'Morning' : 'Evening';
 
     // If it's already logged for targetDate and shift, delete the old record first to allow overwrite
-    deleteInspectionLocally(targetDate, selectedChamber.id, selectedClient, selectedShift);
+    deleteInspectionLocally(targetDate, selectedChamber.id, selectedClient, targetShiftName);
 
     // Calculate overdue_time
     let overdueTimeStr = 'same day';
@@ -687,7 +722,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
       chamber_type: selectedChamberType,
       overdue_time: overdueTimeStr,
       photo_capture_time: captureTimeStr,
-      shift: selectedShift === '10:00 AM' ? 'Morning' : 'Evening'
+      shift: targetShiftName
     };
 
     const success = saveInspectionLocally(newLog);
@@ -789,8 +824,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
   // Details for Chamber Grid cards
   const getChamberDetails = (chamber) => {
     const pattern = getChamberTypeAndDefault(chamber.id);
-    const targetShiftTime = activeShift === 'Morning' ? '10:00 AM' : '04:00 PM';
-    const chamberLogs = completedLogs.filter(log => log.chamber_id === chamber.id && log.entry_time === targetShiftTime);
+    const chamberLogs = completedLogs.filter(log => log.chamber_id === chamber.id && log.shift === activeShift);
     const hasLogs = chamberLogs.length > 0;
     
     const tempVal = hasLogs ? chamberLogs[chamberLogs.length - 1].box_temp : null;
@@ -838,8 +872,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
     if (activeTab === 'All') return chambersList;
     return chambersList.filter(chamber => {
       const chamberTasks = assignments.filter(item => item.chamber_id === chamber.id && item.status !== 'inactive');
-      const targetShiftTime = activeShift === 'Morning' ? '10:00 AM' : '04:00 PM';
-      const chamberLogs = completedLogs.filter(log => log.chamber_id === chamber.id && log.entry_time === targetShiftTime);
+      const chamberLogs = completedLogs.filter(log => log.chamber_id === chamber.id && log.shift === activeShift);
       const isCompleted = chamberLogs.length === chamberTasks.length && chamberTasks.length > 0;
 
       if (activeTab === 'Pending') {
@@ -873,7 +906,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
       
       shiftTasks.push({
         ...item,
-        shift_time: '10:00 AM',
+        shift_time: '10:00',
         shift_label: 'Morning Task'
       });
       
@@ -881,7 +914,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
       if (currentHour >= 16) {
         shiftTasks.push({
           ...item,
-          shift_time: '04:00 PM',
+          shift_time: '16:00',
           shift_label: 'Evening Task'
         });
       }
@@ -893,7 +926,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
         l.chamber_id === item.chamber_id && 
         l.client_name === item.client_name && 
         l.entry_date === todayStr &&
-        l.entry_time === item.shift_time
+        l.shift === (item.shift_time === '10:00' ? 'Morning' : 'Evening')
       );
       const isCompleted = !!log;
       const pattern = getChamberTypeAndDefault(item.chamber_id);
@@ -920,12 +953,12 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
   // Check if a client log exists today for a specific chamber
   const isClientCompletedToday = (chamberId, clientName, entryTime = null) => {
     const todayStr = new Date().toISOString().split('T')[0];
-    const targetShiftTime = entryTime || (activeShift === 'Morning' ? '10:00 AM' : '04:00 PM');
+    const targetShift = entryTime || activeShift;
     return completedLogs.some(log => 
       log.chamber_id === chamberId && 
       log.client_name === clientName && 
       log.entry_date === todayStr &&
-      log.entry_time === targetShiftTime
+      log.shift === targetShift
     );
   };
 
@@ -949,6 +982,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
       setLogSyncStatus(log.sync_status);
       setLogEntryDate(log.entry_date);
       setLogEntryTime(log.entry_time);
+      setLogShift(log.shift || (log.entry_time === '10:00' ? 'Morning' : 'Evening'));
       
       if (log.photo_capture_time) {
         try {
@@ -1082,7 +1116,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
             
             <View style={styles.warehouseRow}>
               <Ionicons name="business-outline" size={16} color="#93c5fd" />
-              <Text style={styles.warehouseText}>Warehouse: Bangalore-1</Text>
+              <Text style={styles.warehouseText}>Warehouse: {user.warehouse_name || 'Generic'}</Text>
             </View>
           </View>
           
@@ -1301,7 +1335,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                 <Ionicons name="checkmark-circle" size={18} color="#16a34a" />
               </View>
               <Text style={[styles.metricValue, { color: '#16a34a' }]}>
-                {completedLogs.filter(log => log.entry_time === (activeShift === 'Morning' ? '10:00 AM' : '04:00 PM')).length}
+                {completedLogs.filter(log => log.shift === activeShift).length}
               </Text>
               <Text style={styles.metricLabel}>Completed</Text>
               <Text style={styles.metricSubtitle}>Today</Text>
@@ -1437,7 +1471,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                 chamberAssignments.forEach(item => {
                   listItems.push({
                     ...item,
-                    shift_time: '10:00 AM',
+                    shift_time: '10:00',
                     shift_label: 'Morning Task'
                   });
                   
@@ -1445,7 +1479,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                   if (currentHour >= 16) {
                     listItems.push({
                       ...item,
-                      shift_time: '04:00 PM',
+                      shift_time: '16:00',
                       shift_label: 'Evening Task'
                     });
                   }
@@ -1458,7 +1492,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                     l.chamber_id === selectedChamber.id && 
                     l.client_name === item.client_name && 
                     l.entry_date === todayStr &&
-                    l.entry_time === item.shift_time
+                    l.shift === (item.shift_time === '10:00' ? 'Morning' : 'Evening')
                   );
                   const isCompleted = !!log;
                   
@@ -1483,8 +1517,8 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                         <View style={styles.taskDetails}>
                           <Text style={styles.taskClientName}>{item.client_name}</Text>
                           <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 4 }}>
-                            <View style={[styles.taskChamberBadge, { backgroundColor: item.shift_time === '10:00 AM' ? '#e0f2fe' : '#fef3c7', borderColor: item.shift_time === '10:00 AM' ? '#bae6fd' : '#fde68a', borderWidth: 0.5 }]}>
-                              <Text style={[styles.taskChamberText, { color: item.shift_time === '10:00 AM' ? '#0369a1' : '#d97706', fontSize: 9 }]}>
+                            <View style={[styles.taskChamberBadge, { backgroundColor: item.shift_time === '10:00' ? '#e0f2fe' : '#fef3c7', borderColor: item.shift_time === '10:00' ? '#bae6fd' : '#fde68a', borderWidth: 0.5 }]}>
+                              <Text style={[styles.taskChamberText, { color: item.shift_time === '10:00' ? '#0369a1' : '#d97706', fontSize: 9 }]}>
                                 {item.shift_label}
                               </Text>
                             </View>
@@ -1598,8 +1632,8 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                           <Text style={styles.taskChamberText}>{item.chamber_name}</Text>
                         </View>
                         {item.shift_time && (
-                          <View style={[styles.taskChamberBadge, { backgroundColor: item.shift_time === '10:00 AM' ? '#e0f2fe' : '#fef3c7', marginLeft: 6, borderColor: item.shift_time === '10:00 AM' ? '#bae6fd' : '#fde68a', borderWidth: 0.5 }]}>
-                            <Text style={[styles.taskChamberText, { color: item.shift_time === '10:00 AM' ? '#0369a1' : '#d97706' }]}>
+                          <View style={[styles.taskChamberBadge, { backgroundColor: item.shift_time === '10:00' ? '#e0f2fe' : '#fef3c7', marginLeft: 6, borderColor: item.shift_time === '10:00' ? '#bae6fd' : '#fde68a', borderWidth: 0.5 }]}>
+                            <Text style={[styles.taskChamberText, { color: item.shift_time === '10:00' ? '#0369a1' : '#d97706' }]}>
                               {item.shift_label}
                             </Text>
                           </View>
@@ -1643,7 +1677,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
   // Export tasks/logs of the selected date as a CSV file/sharing message
   const handleExportDailyLogs = async () => {
     try {
-      const allInspections = getAllLocalInspections();
+      const allInspections = getAllLocalInspections(displayName);
       const selectedDateLogs = allInspections.filter(log => log.entry_date === selectedReportDate);
 
       if (selectedDateLogs.length === 0) {
@@ -1685,7 +1719,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
       console.warn('Primary file share failed, running fallback text share:', err.message);
       try {
         // Fallback: Generate simple CSV text manually and share direct
-        const allInspections = getAllLocalInspections();
+        const allInspections = getAllLocalInspections(displayName);
         const selectedDateLogs = allInspections.filter(log => log.entry_date === selectedReportDate);
         
         let csvContentFallback = 'Date,Chamber,Type,Client,Temp (°C),Boxes,Supervisor,Status,Submission Time,Overdue\n';
@@ -1709,7 +1743,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
   const renderInventoryModal = () => {
     if (!showInventoryModal) return null;
 
-    const allInspections = getAllLocalInspections();
+    const allInspections = getAllLocalInspections(displayName);
     
     // Group logs
     const clientInventory = {};
@@ -2078,7 +2112,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                       <View>
                         <Text style={{ fontSize: 13, fontWeight: '700', color: '#1e293b' }}>{hist.date}</Text>
                         <Text style={{ fontSize: 11, color: '#64748b', marginTop: 3 }}>
-                          Slot: {hist.time === '10:00 AM' ? 'Morning Task' : hist.time === '04:00 PM' ? 'Evening Task' : hist.time}
+                          Slot: {hist.shift === 'Morning' ? 'Morning Task' : hist.shift === 'Evening' ? 'Evening Task' : (hist.time === '10:00' ? 'Morning Task' : hist.time === '16:00' ? 'Evening Task' : hist.time)}
                         </Text>
                       </View>
                       <View style={{ alignItems: 'flex-end' }}>
@@ -2103,7 +2137,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
 
   // C. REPORTS TAB VIEW
   const renderReportsView = () => {
-    const allInspections = getAllLocalInspections();
+    const allInspections = getAllLocalInspections(displayName);
     
     // Filter inspections: if search query is active, search globally across all dates.
     // If search query is empty, show only for the selected report date.
@@ -2632,22 +2666,22 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                           paddingVertical: 10,
                           borderRadius: 8,
                           borderWidth: 1.5,
-                          borderColor: selectedShift === '10:00 AM' ? '#003580' : '#e2e8f0',
-                          backgroundColor: selectedShift === '10:00 AM' ? '#f0f4f8' : '#ffffff',
+                          borderColor: selectedShift === '10:00' ? '#003580' : '#e2e8f0',
+                          backgroundColor: selectedShift === '10:00' ? '#f0f4f8' : '#ffffff',
                           marginRight: 5
                         }}
-                        onPress={() => setSelectedShift('10:00 AM')}
+                        onPress={() => setSelectedShift('10:00')}
                       >
                         <Ionicons 
-                          name={selectedShift === '10:00 AM' ? 'radio-button-on' : 'radio-button-off'} 
+                          name={selectedShift === '10:00' ? 'radio-button-on' : 'radio-button-off'} 
                           size={16} 
-                          color={selectedShift === '10:00 AM' ? '#003580' : '#64748b'} 
+                          color={selectedShift === '10:00' ? '#003580' : '#64748b'} 
                           style={{ marginRight: 6 }}
                         />
                         <Text style={{ 
                           fontSize: 13, 
                           fontWeight: '700', 
-                          color: selectedShift === '10:00 AM' ? '#003580' : '#64748b' 
+                          color: selectedShift === '10:00' ? '#003580' : '#64748b' 
                         }}>
                            Morning Task
                         </Text>
@@ -2665,24 +2699,24 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                               paddingVertical: 10,
                               borderRadius: 8,
                               borderWidth: 1.5,
-                              borderColor: selectedShift === '04:00 PM' ? '#003580' : '#e2e8f0',
-                              backgroundColor: selectedShift === '04:00 PM' ? '#f0f4f8' : (isEveningUnlocked ? '#ffffff' : '#f8fafc'),
+                              borderColor: selectedShift === '16:00' ? '#003580' : '#e2e8f0',
+                              backgroundColor: selectedShift === '16:00' ? '#f0f4f8' : (isEveningUnlocked ? '#ffffff' : '#f8fafc'),
                               marginLeft: 5,
                               opacity: isEveningUnlocked ? 1 : 0.6
                             }}
                             disabled={!isEveningUnlocked}
-                            onPress={() => setSelectedShift('04:00 PM')}
+                            onPress={() => setSelectedShift('16:00')}
                           >
                             <Ionicons 
-                              name={selectedShift === '04:00 PM' ? 'radio-button-on' : 'radio-button-off'} 
+                              name={selectedShift === '16:00' ? 'radio-button-on' : 'radio-button-off'} 
                               size={16} 
-                              color={selectedShift === '04:00 PM' ? '#003580' : '#64748b'} 
+                              color={selectedShift === '16:00' ? '#003580' : '#64748b'} 
                               style={{ marginRight: 6 }}
                             />
                             <Text style={{ 
                               fontSize: 13, 
                               fontWeight: '700', 
-                              color: selectedShift === '04:00 PM' ? '#003580' : '#64748b' 
+                              color: selectedShift === '16:00' ? '#003580' : '#64748b' 
                             }}>
                                Evening Task
                             </Text>
@@ -2693,7 +2727,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                   ) : (
                     <View style={styles.readOnlyField}>
                       <Text style={styles.readOnlyText}>
-                        {logEntryTime === '10:00 AM' ? 'Morning Task' : logEntryTime === '04:00 PM' ? 'Evening Task' : 'Task Slot'}
+                        {logShift === 'Morning' ? 'Morning Task' : logShift === 'Evening' ? 'Evening Task' : 'Task Slot'}
                       </Text>
                     </View>
                   )}
@@ -3441,42 +3475,29 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
         visible={showDrawer}
         animationType="none"
         transparent
-        onRequestClose={() => setShowDrawer(false)}
+        onRequestClose={closeDrawer}
       >
         <View style={styles.drawerOverlay}>
-          {/* Backdrop Touch Area to close */}
-          <TouchableOpacity 
-            style={styles.drawerBackdrop} 
-            activeOpacity={1} 
-            onPress={() => setShowDrawer(false)} 
-          />
-          
-          {/* Drawer Content Panel */}
-          <View style={styles.drawerPanel}>
-            {/* Drawer Header */}
+          {/* Drawer Content Panel (rendered first to slide out from Left side) */}
+          <Animated.View style={[styles.drawerPanel, { transform: [{ translateX: drawerAnim }] }]}>
+            {/* Drawer Header (Contains Operator Profile & Close Button) */}
             <View style={styles.drawerHeader}>
-              <View style={styles.drawerBrandContainer}>
-                <Ionicons name="cube" size={24} color="#003580" />
-                <Text style={styles.drawerBrandText}>ReeferON CRM</Text>
+              <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1 }}>
+                <View style={styles.drawerUserAvatar}>
+                  <Ionicons name="person" size={18} color="#003580" />
+                </View>
+                <View style={{ marginLeft: 10, flex: 1 }}>
+                  <Text style={styles.drawerUserName} numberOfLines={1}>
+                    {displayName}
+                  </Text>
+                  <Text style={styles.drawerUserRole}>
+                    {user?.role === 'do_operator' ? 'Data Operator' : 'Operator'}
+                  </Text>
+                </View>
               </View>
-              <TouchableOpacity onPress={() => setShowDrawer(false)}>
+              <TouchableOpacity onPress={closeDrawer} style={{ marginLeft: 10 }}>
                 <Ionicons name="close-circle-outline" size={26} color="#64748b" />
               </TouchableOpacity>
-            </View>
-
-            {/* User Profile Card inside Drawer */}
-            <View style={styles.drawerUserCard}>
-              <View style={styles.drawerUserAvatar}>
-                <Ionicons name="person" size={20} color="#003580" />
-              </View>
-              <View style={{ marginLeft: 12, flex: 1 }}>
-                <Text style={styles.drawerUserName} numberOfLines={1}>
-                  {displayName}
-                </Text>
-                <Text style={styles.drawerUserRole}>
-                  {user?.role === 'do_operator' ? 'Data Operator' : 'Operator'}
-                </Text>
-              </View>
             </View>
 
             {/* Menu Options List */}
@@ -3490,7 +3511,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                 ]}
                 onPress={() => {
                   handleNavTabChange('Dashboard');
-                  setShowDrawer(false);
+                  closeDrawer();
                 }}
               >
                 <Ionicons 
@@ -3515,7 +3536,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                 ]}
                 onPress={() => {
                   handleNavTabChange('Tasks');
-                  setShowDrawer(false);
+                  closeDrawer();
                 }}
               >
                 <Ionicons 
@@ -3539,7 +3560,7 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
               <TouchableOpacity 
                 style={styles.drawerLogoutBtn}
                 onPress={() => {
-                  setShowDrawer(false);
+                  closeDrawer();
                   onLogout();
                 }}
               >
@@ -3547,8 +3568,14 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                 <Text style={styles.drawerLogoutText}>Logout Session</Text>
               </TouchableOpacity>
             </View>
+          </Animated.View>
 
-          </View>
+          {/* Backdrop Touch Area to close (rendered second to fill right side) */}
+          <TouchableOpacity 
+            style={styles.drawerBackdrop} 
+            activeOpacity={1} 
+            onPress={closeDrawer} 
+          />
         </View>
       </Modal>
     );
