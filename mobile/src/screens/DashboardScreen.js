@@ -239,6 +239,10 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
   const [selectedInventoryItem, setSelectedInventoryItem] = useState(null);
   const [showHistoryModal, setShowHistoryModal] = useState(false);
   const [showNotificationsModal, setShowNotificationsModal] = useState(false);
+  const [inventoryClientSearch, setInventoryClientSearch] = useState('');
+  const [inventoryChamberSearch, setInventoryChamberSearch] = useState('');
+  const [showInventoryClientDropdown, setShowInventoryClientDropdown] = useState(false);
+  const [showInventoryChamberDropdown, setShowInventoryChamberDropdown] = useState(false);
   const [calendarMonth, setCalendarMonth] = useState(new Date());
   const [showClientDropdown, setShowClientDropdown] = useState(false);
   const [showChamberDropdown, setShowChamberDropdown] = useState(false);
@@ -543,18 +547,41 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
       currAssignments.forEach(item => {
         if (item.status === 'inactive') return;
         
-        const hasLogForDate = allInspections.some(l => 
+        const hasMorningLog = allInspections.some(l => 
           l.chamber_id === item.chamber_id && 
           l.client_name === item.client_name && 
-          l.entry_date === date
+          l.entry_date === date &&
+          (l.shift === 'Morning' || l.entry_time === '10:00')
         );
         
-        if (!hasLogForDate) {
+        if (!hasMorningLog) {
           overdueList.push({
             ...item,
-            id: `overdue_${item.chamber_id}_${item.client_name.replace(/\s+/g, '')}_${date}`,
+            id: `overdue_${item.chamber_id}_${item.client_name.replace(/\s+/g, '')}_${date}_Morning`,
             due_date: date,
-            is_overdue: true
+            is_overdue: true,
+            shift: 'Morning',
+            shift_time: '10:00',
+            shift_label: 'Morning'
+          });
+        }
+
+        const hasEveningLog = allInspections.some(l => 
+          l.chamber_id === item.chamber_id && 
+          l.client_name === item.client_name && 
+          l.entry_date === date &&
+          (l.shift === 'Evening' || l.entry_time === '16:00')
+        );
+        
+        if (!hasEveningLog) {
+          overdueList.push({
+            ...item,
+            id: `overdue_${item.chamber_id}_${item.client_name.replace(/\s+/g, '')}_${date}_Evening`,
+            due_date: date,
+            is_overdue: true,
+            shift: 'Evening',
+            shift_time: '16:00',
+            shift_label: 'Evening'
           });
         }
       });
@@ -1052,6 +1079,30 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
     setShowLogModal(true);
   };
 
+  const handleOpenChamberLogFormDirect = (chamber) => {
+    if (!chamber) return;
+    
+    const chamberClients = assignments.filter(item => item.chamber_id === chamber.id && item.status !== 'inactive');
+    const unloggedClient = chamberClients.find(item => !isClientCompletedToday(chamber.id, item.client_name));
+    
+    if (!unloggedClient) {
+      Alert.alert('Chamber Completed', 'All clients in this chamber have already been logged today.');
+      return;
+    }
+    
+    setSelectedChamber(chamber);
+    setSelectedClient(unloggedClient.client_name);
+    setTempInput('');
+    setBoxCountInput('');
+    setCapturedImage(null);
+    setCapturedImageTimestamp(null);
+    setSelectedChamberType(getChamberTypeAndDefault(chamber.id).type);
+    setIsProfileEditable(true);
+    setOpenedFromFab(false);
+    setShowClientDropdown(false);
+    setShowLogModal(true);
+  };
+
   // Opens Log Form when selected chamber is active
   const handleOpenChamberLogForm = () => {
     if (!selectedChamber) return;
@@ -1362,191 +1413,68 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
         </View>
 
         {/* 2-column chambers grid view */}
-        {!selectedChamber ? (
-          <>
-            <View style={styles.metricsHeaderRow}>
-              <Text style={styles.metricsTitle}>Chamber Overview ({chambersList.length} Chambers)</Text>
-              <TouchableOpacity onPress={() => handleNavTabChange('Tasks')}>
-                <Text style={styles.viewAllText}>View All</Text>
-              </TouchableOpacity>
+        <View style={styles.metricsHeaderRow}>
+          <Text style={styles.metricsTitle}>Chamber Overview ({chambersList.length} Chambers)</Text>
+          <TouchableOpacity onPress={() => handleNavTabChange('Tasks')}>
+            <Text style={styles.viewAllText}>View All</Text>
+          </TouchableOpacity>
+        </View>
+
+        <View style={styles.chambersGrid}>
+          {getFilteredChambers().length === 0 ? (
+            <View style={styles.emptyGridPlaceholder}>
+              <Ionicons name="apps-outline" size={32} color="#94a3b8" />
+              <Text style={styles.emptyGridText}>No chambers found matching "{activeTab}" filter.</Text>
             </View>
+          ) : (
+            getFilteredChambers().map((chamber) => {
+              const details = getChamberDetails(chamber);
+              const chamberTasks = assignments.filter(item => item.chamber_id === chamber.id);
+              const completedChamberLogs = completedLogs.filter(log => log.chamber_id === chamber.id);
+              const clientNames = Array.from(new Set(chamberTasks.map(t => t.client_name).filter(Boolean))).join(', ');
 
-            <View style={styles.chambersGrid}>
-              {getFilteredChambers().length === 0 ? (
-                <View style={styles.emptyGridPlaceholder}>
-                  <Ionicons name="apps-outline" size={32} color="#94a3b8" />
-                  <Text style={styles.emptyGridText}>No chambers found matching "{activeTab}" filter.</Text>
-                </View>
-              ) : (
-                getFilteredChambers().map((chamber) => {
-                  const details = getChamberDetails(chamber);
-                  const chamberTasks = assignments.filter(item => item.chamber_id === chamber.id);
-                  const completedChamberLogs = completedLogs.filter(log => log.chamber_id === chamber.id);
-                  const clientNames = Array.from(new Set(chamberTasks.map(t => t.client_name).filter(Boolean))).join(', ');
+              return (
+                <TouchableOpacity
+                  key={chamber.id}
+                  style={[
+                    styles.chamberCard, 
+                    details.hasAlert && styles.chamberCardAlertBorder
+                  ]}
+                  onPress={() => handleOpenChamberLogFormDirect(chamber)}
+                >
+                  {/* Left: Chamber details */}
+                  <View style={{ flex: 1.5, alignItems: 'flex-start' }}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 4 }}>
+                      <Ionicons name={details.icon} size={14} color={details.pillColor} style={{ marginRight: 6 }} />
+                      <Text style={{ fontSize: 13, fontWeight: 'bold', color: '#1e293b' }}>{chamber.name}</Text>
+                    </View>
+                    <View style={[styles.typePill, { backgroundColor: details.pillBg, marginVertical: 0 }]}>
+                      <Text style={[styles.typePillText, { color: details.pillColor }]}>{details.type}</Text>
+                    </View>
+                  </View>
 
-                  return (
-                    <TouchableOpacity
-                      key={chamber.id}
-                      style={[
-                        styles.chamberCard, 
-                        details.hasAlert && styles.chamberCardAlertBorder
-                      ]}
-                      onPress={() => {
-                        setSelectedChamber(chamber);
-                        setSelectedClient(null);
-                        setTempInput('');
-                        setBoxCountInput('');
-                        setCapturedImage(null);
-                        setCapturedImageTimestamp(null);
-                        setIsProfileEditable(true);
-                        setOpenedFromFab(false);
-                        setShowLogModal(true);
-                      }}
-                    >
-                      {/* Left: Chamber details */}
-                      <View style={{ flex: 1.5, alignItems: 'flex-start' }}>
-                        <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 4 }}>
-                          <Ionicons name={details.icon} size={14} color={details.pillColor} style={{ marginRight: 6 }} />
-                          <Text style={{ fontSize: 13, fontWeight: 'bold', color: '#1e293b' }}>{chamber.name}</Text>
-                        </View>
-                        <View style={[styles.typePill, { backgroundColor: details.pillBg, marginVertical: 0 }]}>
-                          <Text style={[styles.typePillText, { color: details.pillColor }]}>{details.type}</Text>
-                        </View>
-                      </View>
+                  {/* Middle: Clients list */}
+                  <View style={{ flex: 2, paddingHorizontal: 12, borderLeftWidth: 1, borderRightWidth: 1, borderColor: '#e2e8f0' }}>
+                    <Text style={{ fontSize: 9, fontWeight: '700', color: '#94a3b8', textTransform: 'uppercase', marginBottom: 2 }}>Clients</Text>
+                    <Text style={{ fontSize: 12, fontWeight: '700', color: '#334155' }} numberOfLines={2}>
+                      {clientNames || 'No Clients'}
+                    </Text>
+                  </View>
 
-                      {/* Middle: Clients list */}
-                      <View style={{ flex: 2, paddingHorizontal: 12, borderLeftWidth: 1, borderRightWidth: 1, borderColor: '#e2e8f0' }}>
-                        <Text style={{ fontSize: 9, fontWeight: '700', color: '#94a3b8', textTransform: 'uppercase', marginBottom: 2 }}>Clients</Text>
-                        <Text style={{ fontSize: 12, fontWeight: '700', color: '#334155' }} numberOfLines={2}>
-                          {clientNames || 'No Clients'}
-                        </Text>
-                      </View>
-
-                      {/* Right: Status indicator */}
-                      <View style={{ flex: 1, alignItems: 'flex-end', justifyContent: 'center' }}>
-                        <View style={[styles.statusIndicatorRow, { marginTop: 0 }]}>
-                          <View style={[styles.statusDot, { backgroundColor: details.statusColor }]} />
-                          <Text style={[styles.statusText, { color: details.statusColor, fontSize: 11 }]}>
-                            {completedChamberLogs.length === chamberTasks.length ? 'Done' : 'Normal'}
-                          </Text>
-                        </View>
-                      </View>
-                    </TouchableOpacity>
-                  );
-                })
-              )}
-            </View>
-          </>
-        ) : (
-          // Drill-down Chamber View
-          <>
-            <View style={styles.chamberHeaderRow}>
-              <TouchableOpacity 
-                style={styles.backBtn}
-                onPress={() => setSelectedChamber(null)}
-              >
-                <Ionicons name="arrow-back" size={20} color="#003580" />
-                <Text style={styles.backBtnText}>Back to Chambers</Text>
-              </TouchableOpacity>
-              <Text style={styles.selectedChamberTitle}>{selectedChamber.name}</Text>
-            </View>
-
-            <View style={styles.actionContainer}>
-              <TouchableOpacity 
-                style={styles.recordLogBtn} 
-                onPress={handleOpenChamberLogForm}
-              >
-                <Ionicons name="thermometer-outline" size={20} color="#ffffff" style={{ marginRight: 8 }} />
-                <Text style={styles.recordLogBtnText}>Log Chamber Temperature</Text>
-              </TouchableOpacity>
-            </View>
-
-            {/* List of client lots in this chamber */}
-            <View style={styles.tasksSection}>
-              <Text style={styles.tasksSectionTitle}>Client Lots Checklist</Text>
-              {(() => {
-                const chamberAssignments = assignments.filter(item => item.chamber_id === selectedChamber.id && item.status !== 'inactive');
-                
-                const listItems = [];
-                chamberAssignments.forEach(item => {
-                  listItems.push({
-                    ...item,
-                    shift_time: '10:00',
-                    shift_label: 'Morning Task'
-                  });
-                  
-                  const currentHour = new Date().getHours();
-                  if (currentHour >= 16) {
-                    listItems.push({
-                      ...item,
-                      shift_time: '16:00',
-                      shift_label: 'Evening Task'
-                    });
-                  }
-                });
-
-                return listItems.map((item, idx) => {
-                  const todayStr = new Date().toISOString().split('T')[0];
-                  
-                  const log = completedLogs.find(l => 
-                    l.chamber_id === selectedChamber.id && 
-                    l.client_name === item.client_name && 
-                    l.entry_date === todayStr &&
-                    l.shift === (item.shift_time === '10:00' ? 'Morning' : 'Evening')
-                  );
-                  const isCompleted = !!log;
-                  
-                  return (
-                    <TouchableOpacity
-                      key={`${item.client_name}_${item.shift_time}_${idx}`}
-                      style={[styles.taskItemCard, isCompleted && styles.taskItemCardCompleted]}
-                      activeOpacity={0.7}
-                      onPress={() => handleOpenTaskLogForm(item)}
-                    >
-                      <View style={styles.taskItemLeft}>
-                        <View style={[
-                          styles.statusIndicator,
-                          { backgroundColor: isCompleted ? '#22c55e' : '#f59e0b' }
-                        ]}>
-                          <Ionicons 
-                            name={isCompleted ? 'checkmark' : 'ellipse-outline'} 
-                            size={12} 
-                            color="#ffffff" 
-                          />
-                        </View>
-                        <View style={styles.taskDetails}>
-                          <Text style={styles.taskClientName}>{item.client_name}</Text>
-                          <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 4 }}>
-                            <View style={[styles.taskChamberBadge, { backgroundColor: item.shift_time === '10:00' ? '#e0f2fe' : '#fef3c7', borderColor: item.shift_time === '10:00' ? '#bae6fd' : '#fde68a', borderWidth: 0.5 }]}>
-                              <Text style={[styles.taskChamberText, { color: item.shift_time === '10:00' ? '#0369a1' : '#d97706', fontSize: 9 }]}>
-                                {item.shift_label}
-                              </Text>
-                            </View>
-                          </View>
-                          <Text style={[styles.taskClientMeta, { marginTop: 4 }]}>
-                            {isCompleted 
-                              ? `Logged Temp: ${log?.box_temp}°C at ${log?.entry_time} | Ref: ${log?.reference_no || 'Pending Sync'}` 
-                              : 'Reading Pending'
-                            }
-                          </Text>
-                        </View>
-                      </View>
-                      
-                      {!isCompleted ? (
-                        <View style={styles.pendingActionWrapper}>
-                          <Text style={styles.pendingActionText}>Record Log</Text>
-                          <Ionicons name="chevron-forward" size={14} color="#003580" />
-                        </View>
-                      ) : (
-                        <Ionicons name="information-circle-outline" size={20} color="#16a34a" />
-                      )}
-                    </TouchableOpacity>
-                  );
-                });
-              })()}
-            </View>
-          </>
-        )}
+                  {/* Right: Status indicator */}
+                  <View style={{ flex: 1, alignItems: 'flex-end', justifyContent: 'center' }}>
+                    <View style={[styles.statusIndicatorRow, { marginTop: 0 }]}>
+                      <View style={[styles.statusDot, { backgroundColor: details.statusColor }]} />
+                      <Text style={[styles.statusText, { color: details.statusColor, fontSize: 11 }]}>
+                        {completedChamberLogs.length === chamberTasks.length ? 'Done' : 'Normal'}
+                      </Text>
+                    </View>
+                  </View>
+                </TouchableOpacity>
+              );
+            })
+          )}
+        </View>
 
         <View style={{ height: 90 }} />
       </ScrollView>
@@ -1570,6 +1498,37 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
               </Text>
             </TouchableOpacity>
           ))}
+        </View>
+
+        {/* Tab Caption Info Box */}
+        <View style={{ backgroundColor: '#f8fafc', padding: 10, marginHorizontal: 15, marginTop: 8, borderRadius: 6, borderWidth: 0.5, borderColor: '#e2e8f0' }}>
+          <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+            <Ionicons 
+              name={
+                activeTab === 'All' ? 'list-circle-outline' :
+                activeTab === 'Pending' ? 'time-outline' :
+                activeTab === 'Completed' ? 'checkmark-circle-outline' :
+                'alert-circle-outline'
+              } 
+              size={15} 
+              color={
+                activeTab === 'All' ? '#64748b' :
+                activeTab === 'Pending' ? '#f59e0b' :
+                activeTab === 'Completed' ? '#22c55e' :
+                '#ef4444'
+              } 
+              style={{ marginRight: 6 }}
+            />
+            <Text style={{ fontSize: 10, fontWeight: 'bold', color: '#1e293b', textTransform: 'uppercase', letterSpacing: 0.5 }}>
+              {activeTab} Tasks Info
+            </Text>
+          </View>
+          <Text style={{ fontSize: 10.5, color: '#475569', marginTop: 4, lineHeight: 14 }}>
+            {activeTab === 'All' && 'View all today\'s schedules. Complete pending tasks to ensure temperature records are updated.'}
+            {activeTab === 'Pending' && 'Pending shift inspections. Click to take a live box photo and input box count & temperature.'}
+            {activeTab === 'Completed' && 'Inspections recorded successfully. Checked items will sync to the server automatically.'}
+            {activeTab === 'Overdue' && 'Missed audits from past 5 days. Solve by tapping the task to log missed shift readings.'}
+          </Text>
         </View>
 
         <ScrollView 
@@ -1638,12 +1597,14 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
                             </Text>
                           </View>
                         )}
-                        {item.is_overdue && (
-                          <View style={{ backgroundColor: '#fee2e2', paddingHorizontal: 6, paddingVertical: 1.5, borderRadius: 4, marginLeft: 6, borderWidth: 0.5, borderColor: '#fca5a5' }}>
-                            <Text style={{ fontSize: 9, color: '#ef4444', fontWeight: 'bold' }}>Overdue: {item.due_date}</Text>
-                          </View>
-                        )}
                       </View>
+                      {item.is_overdue && (
+                        <View style={{ backgroundColor: '#fee2e2', paddingHorizontal: 6, paddingVertical: 1.5, borderRadius: 4, marginTop: 4, alignSelf: 'flex-start', borderWidth: 0.5, borderColor: '#fca5a5' }}>
+                          <Text style={{ fontSize: 9, color: '#ef4444', fontWeight: 'bold' }}>
+                            Overdue: {item.due_date}
+                          </Text>
+                        </View>
+                      )}
                     </View>
                   </View>
 
@@ -1772,6 +1733,20 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
       return item;
     });
 
+    const filteredInventoryList = inventoryList.filter(item => {
+      if (inventoryClientSearch.trim() !== '') {
+        if (!item.clientName.toLowerCase().includes(inventoryClientSearch.toLowerCase())) {
+          return false;
+        }
+      }
+      if (inventoryChamberSearch.trim() !== '') {
+        if (!item.chamberName.toLowerCase().includes(inventoryChamberSearch.toLowerCase())) {
+          return false;
+        }
+      }
+      return true;
+    });
+
     return (
       <Modal visible={showInventoryModal} animationType="slide" transparent={false} onRequestClose={() => setShowInventoryModal(false)}>
         <SafeAreaView style={{ flex: 1, backgroundColor: '#f1f5f9' }}>
@@ -1798,15 +1773,166 @@ export default function DashboardScreen({ user, token, apiUrl, onUpdateApiUrl, o
             </TouchableOpacity>
           </View>
 
+          {/* Search Filters Row */}
+          <View style={{ 
+            flexDirection: 'row', 
+            paddingHorizontal: 16, 
+            paddingVertical: 10, 
+            backgroundColor: '#ffffff', 
+            borderBottomWidth: 1, 
+            borderColor: '#e2e8f0',
+            zIndex: 10
+          }}>
+            {/* Client Dropdown */}
+            <View style={{ flex: 1, marginRight: 8, position: 'relative' }}>
+              <TouchableOpacity 
+                style={{
+                  height: 38,
+                  backgroundColor: '#f8fafc',
+                  borderRadius: 8,
+                  borderWidth: 1,
+                  borderColor: '#cbd5e1',
+                  paddingHorizontal: 10,
+                  flexDirection: 'row',
+                  alignItems: 'center',
+                  justifyContent: 'space-between'
+                }}
+                onPress={() => {
+                  setShowInventoryClientDropdown(!showInventoryClientDropdown);
+                  setShowInventoryChamberDropdown(false);
+                }}
+              >
+                <Text style={{ fontSize: 11, color: '#1e293b', fontWeight: '600' }} numberOfLines={1}>
+                  {inventoryClientSearch || 'All Clients'}
+                </Text>
+                <Ionicons name={showInventoryClientDropdown ? 'chevron-up' : 'chevron-down'} size={14} color="#64748b" />
+              </TouchableOpacity>
+
+              {showInventoryClientDropdown && (
+                <View style={{
+                  position: 'absolute',
+                  top: 42,
+                  left: 0,
+                  right: 0,
+                  backgroundColor: '#ffffff',
+                  borderRadius: 8,
+                  borderWidth: 1,
+                  borderColor: '#cbd5e1',
+                  maxHeight: 150,
+                  zIndex: 20,
+                  shadowColor: '#000',
+                  shadowOffset: { width: 0, height: 2 },
+                  shadowOpacity: 0.15,
+                  shadowRadius: 4,
+                  elevation: 5
+                }}>
+                  <ScrollView nestedScrollEnabled={true} keyboardShouldPersistTaps="handled">
+                    <TouchableOpacity 
+                      style={{ padding: 10, borderBottomWidth: 0.5, borderColor: '#f1f5f9' }}
+                      onPress={() => {
+                        setInventoryClientSearch('');
+                        setShowInventoryClientDropdown(false);
+                      }}
+                    >
+                      <Text style={{ fontSize: 11, color: '#0f172a', fontWeight: '700' }}>All Clients</Text>
+                    </TouchableOpacity>
+                    {Array.from(new Set(assignments.map(a => a.client_name).filter(Boolean))).sort().map(clientName => (
+                      <TouchableOpacity 
+                        key={clientName}
+                        style={{ padding: 10, borderBottomWidth: 0.5, borderColor: '#f1f5f9' }}
+                        onPress={() => {
+                          setInventoryClientSearch(clientName);
+                          setShowInventoryClientDropdown(false);
+                        }}
+                      >
+                        <Text style={{ fontSize: 11, color: '#334155' }}>{clientName}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </ScrollView>
+                </View>
+              )}
+            </View>
+
+            {/* Chamber Dropdown */}
+            <View style={{ flex: 1, position: 'relative' }}>
+              <TouchableOpacity 
+                style={{
+                  height: 38,
+                  backgroundColor: '#f8fafc',
+                  borderRadius: 8,
+                  borderWidth: 1,
+                  borderColor: '#cbd5e1',
+                  paddingHorizontal: 10,
+                  flexDirection: 'row',
+                  alignItems: 'center',
+                  justifyContent: 'space-between'
+                }}
+                onPress={() => {
+                  setShowInventoryChamberDropdown(!showInventoryChamberDropdown);
+                  setShowInventoryClientDropdown(false);
+                }}
+              >
+                <Text style={{ fontSize: 11, color: '#1e293b', fontWeight: '600' }} numberOfLines={1}>
+                  {inventoryChamberSearch || 'All Chambers'}
+                </Text>
+                <Ionicons name={showInventoryChamberDropdown ? 'chevron-up' : 'chevron-down'} size={14} color="#64748b" />
+              </TouchableOpacity>
+
+              {showInventoryChamberDropdown && (
+                <View style={{
+                  position: 'absolute',
+                  top: 42,
+                  left: 0,
+                  right: 0,
+                  backgroundColor: '#ffffff',
+                  borderRadius: 8,
+                  borderWidth: 1,
+                  borderColor: '#cbd5e1',
+                  maxHeight: 150,
+                  zIndex: 20,
+                  shadowColor: '#000',
+                  shadowOffset: { width: 0, height: 2 },
+                  shadowOpacity: 0.15,
+                  shadowRadius: 4,
+                  elevation: 5
+                }}>
+                  <ScrollView nestedScrollEnabled={true} keyboardShouldPersistTaps="handled">
+                    <TouchableOpacity 
+                      style={{ padding: 10, borderBottomWidth: 0.5, borderColor: '#f1f5f9' }}
+                      onPress={() => {
+                        setInventoryChamberSearch('');
+                        setShowInventoryChamberDropdown(false);
+                      }}
+                    >
+                      <Text style={{ fontSize: 11, color: '#0f172a', fontWeight: '700' }}>All Chambers</Text>
+                    </TouchableOpacity>
+                    {Array.from(new Set(assignments.map(a => a.chamber_name).filter(Boolean))).sort().map(chamberName => (
+                      <TouchableOpacity 
+                        key={chamberName}
+                        style={{ padding: 10, borderBottomWidth: 0.5, borderColor: '#f1f5f9' }}
+                        onPress={() => {
+                          setInventoryChamberSearch(chamberName);
+                          setShowInventoryChamberDropdown(false);
+                        }}
+                      >
+                        <Text style={{ fontSize: 11, color: '#334155' }}>{chamberName}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </ScrollView>
+                </View>
+              )}
+            </View>
+          </View>
+
           {/* List content */}
           <ScrollView contentContainerStyle={{ padding: 16, paddingBottom: 40 }} showsVerticalScrollIndicator={false}>
-            {inventoryList.length === 0 ? (
+            {filteredInventoryList.length === 0 ? (
               <View style={[styles.reportsEmptyRow, { backgroundColor: '#ffffff', padding: 24, borderRadius: 12 }]}>
                 <Ionicons name="cube-outline" size={32} color="#94a3b8" />
-                <Text style={[styles.reportsEmptyText, { marginTop: 10 }]}>No client inventory data logged yet.</Text>
+                <Text style={[styles.reportsEmptyText, { marginTop: 10 }]}>No client inventory data matching filter.</Text>
               </View>
             ) : (
-              inventoryList.map((item, idx) => {
+              filteredInventoryList.map((item, idx) => {
                 const latest = item.history[0];
                 const showTrend = item.history.length > 1;
                 const diff = showTrend ? (latest.boxCount - item.history[1].boxCount) : 0;

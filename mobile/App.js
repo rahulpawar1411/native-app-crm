@@ -31,7 +31,7 @@ const getApiBaseUrl = () => {
     return `http://${DEFAULT_IP}:5000`;
   }
   // Production URL fallback
-  return `http://${DEFAULT_IP}:5000`;
+  return 'https://reeferon-crm-backend.onrender.com';
 };
 
 const API_BASE_URL = getApiBaseUrl();

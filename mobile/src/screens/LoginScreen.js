@@ -127,7 +127,7 @@ export default function LoginScreen({ onLoginSuccess, apiUrl, onUpdateApiUrl }) 
         
         {/* Top Header Background with Image */}
         <ImageBackground
-          source={require('../../assets/warehouse_bg.png')}
+          source={require('../../assets/warehouse_bg.jpg')}
           style={[
             styles.headerBackground,
             { height: height * 0.35 }
