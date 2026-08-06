@@ -1,12 +1,12 @@
 import React, { useState, useEffect } from 'react';
-import { StyleSheet, View, NativeModules, Platform, ActivityIndicator } from 'react-native';
+import { StyleSheet, View, NativeModules, Platform, ActivityIndicator, Linking } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import LoginScreen from './src/screens/LoginScreen';
 import DashboardScreen from './src/screens/DashboardScreen';
 
 // Automatically detect local machine IP in development (from Metro bundler)
 const getApiBaseUrl = () => {
-  const DEFAULT_IP = '192.168.254.129'; // Your computer's current local Wi-Fi IP
+  const DEFAULT_IP = '192.168.147.129'; // Your computer's current local Wi-Fi IP
   if (__DEV__) {
     try {
       const scriptURL = NativeModules.SourceCode?.scriptURL || '';
@@ -64,6 +64,19 @@ export default function App() {
       }
     };
     restoreSession();
+  }, []);
+
+  // Deep link: reeferon://login (dev/production build) or Expo Go exp://…/--/login
+  useEffect(() => {
+    const handleUrl = (url) => {
+      if (!url) return;
+      // Opening the app is enough — Login screen shows when logged out
+      console.log('[deep-link]', url);
+    };
+
+    Linking.getInitialURL().then(handleUrl).catch(() => {});
+    const sub = Linking.addEventListener('url', ({ url }) => handleUrl(url));
+    return () => sub.remove();
   }, []);
 
   /**
@@ -128,7 +141,6 @@ export default function App() {
           user={user} 
           token={token} 
           apiUrl={apiUrl} 
-          onUpdateApiUrl={handleUpdateApiUrl} 
           onLogout={handleLogout} 
         />
       )}
