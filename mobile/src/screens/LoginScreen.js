@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   StyleSheet,
   Text,
@@ -22,15 +22,15 @@ import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
  * ====================================================================
  * Renders the brand logo, email/password credentials input, and role-based
  * quick login shortcuts. It is fully responsive across different mobile sizes.
- * 
- * Developer Guide:
- * - Form submission currently triggers a mock success with the extracted username.
- * - In production, replace `handleSignIn` with a call to `POST /api/auth/login`.
- * - The quick login grid at the bottom is designed for developer testing and QA 
- *   to quickly toggle between user personas.
  * ====================================================================
  */
-export default function LoginScreen({ onLoginSuccess, apiUrl, onUpdateApiUrl }) {
+export default function LoginScreen({
+  onLoginSuccess,
+  apiUrl,
+  onUpdateApiUrl,
+  productionApiUrl = 'https://reeferon-crm-backend.onrender.com',
+  localApiUrl = 'http://192.168.147.129:5000'
+}) {
   // Input form state variables
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -38,6 +38,20 @@ export default function LoginScreen({ onLoginSuccess, apiUrl, onUpdateApiUrl }) 
   const [loading, setLoading] = useState(false);
   const [apiUrlInput, setApiUrlInput] = useState(apiUrl);
   const [showSettings, setShowSettings] = useState(false);
+
+  const isProduction =
+    (apiUrl || '').toLowerCase().includes('onrender.com') ||
+    (apiUrl || '').toLowerCase().startsWith('https://');
+
+  useEffect(() => {
+    setApiUrlInput(apiUrl);
+  }, [apiUrl]);
+
+  const applyServer = (url) => {
+    const clean = String(url || '').trim().replace(/\/$/, '');
+    setApiUrlInput(clean);
+    onUpdateApiUrl(clean);
+  };
 
   // Responsive layout scaling triggers
   const { width, height } = useWindowDimensions();
@@ -229,12 +243,44 @@ export default function LoginScreen({ onLoginSuccess, apiUrl, onUpdateApiUrl }) 
 
           {showSettings && (
             <View style={{ marginBottom: 12 }}>
+              <Text style={styles.inputLabel}>Server</Text>
+              <View style={{ flexDirection: 'row', gap: 8, marginBottom: 10 }}>
+                <TouchableOpacity
+                  onPress={() => applyServer(productionApiUrl)}
+                  style={{
+                    flex: 1,
+                    paddingVertical: 10,
+                    borderRadius: 8,
+                    alignItems: 'center',
+                    backgroundColor: isProduction ? '#0033a0' : '#e2e8f0'
+                  }}
+                >
+                  <Text style={{ fontSize: 12, fontWeight: '800', color: isProduction ? '#fff' : '#334155' }}>
+                    Production
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={() => applyServer(localApiUrl)}
+                  style={{
+                    flex: 1,
+                    paddingVertical: 10,
+                    borderRadius: 8,
+                    alignItems: 'center',
+                    backgroundColor: !isProduction ? '#0033a0' : '#e2e8f0'
+                  }}
+                >
+                  <Text style={{ fontSize: 12, fontWeight: '800', color: !isProduction ? '#fff' : '#334155' }}>
+                    Local
+                  </Text>
+                </TouchableOpacity>
+              </View>
+
               <Text style={styles.inputLabel}>Server Connection URL</Text>
               <View style={styles.inputWrapper}>
                 <Ionicons name="server-outline" size={18} color="#94a3b8" style={styles.inputIcon} />
                 <TextInput
                   style={styles.input}
-                  placeholder="https://your-backend.up.railway.app"
+                  placeholder={productionApiUrl}
                   placeholderTextColor="#94a3b8"
                   value={apiUrlInput}
                   onChangeText={(txt) => {
@@ -245,6 +291,9 @@ export default function LoginScreen({ onLoginSuccess, apiUrl, onUpdateApiUrl }) 
                   autoCorrect={false}
                 />
               </View>
+              <Text style={{ marginTop: 6, fontSize: 10, color: '#64748b' }}>
+                {isProduction ? 'Using Render (production)' : `Using local: ${localApiUrl}`}
+              </Text>
             </View>
           )}
 

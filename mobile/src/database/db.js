@@ -138,10 +138,92 @@ export const initDatabase = () => {
       db.execSync(`ALTER TABLE local_inspections ADD COLUMN updated_at TEXT DEFAULT NULL;`);
       console.log('🌱 SQLite: Added updated_at column to local_inspections.');
     } catch (err) {}
+
+    // Suggestion pool + defaults used when seeding empty chambers
+    db.execSync(`
+      CREATE TABLE IF NOT EXISTS client_lot_master (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        client_name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    const DEFAULT_LOTS = [
+      'Reliance Fresh',
+      'BigBasket Cold',
+      'Mother Dairy',
+      'Amul Logistics',
+      'ITC Foods Lot',
+      'FreshToHome',
+      'Licious Cold Chain',
+      'Amazon Fresh Lot'
+    ];
+    for (const name of DEFAULT_LOTS) {
+      try {
+        db.runSync(
+          'INSERT OR IGNORE INTO client_lot_master (client_name) VALUES (?);',
+          [name]
+        );
+      } catch (_) {}
+    }
     
     console.log('✅ SQLite Database Tables initialized successfully.');
   } catch (error) {
     console.error('❌ Failed to initialize SQLite database tables:', error);
+  }
+};
+
+/** Default seeded client lot names (also in client_lot_master). */
+export const DEFAULT_CLIENT_LOT_MASTER = [
+  'Reliance Fresh',
+  'BigBasket Cold',
+  'Mother Dairy',
+  'Amul Logistics',
+  'ITC Foods Lot',
+  'FreshToHome',
+  'Licious Cold Chain',
+  'Amazon Fresh Lot'
+];
+
+/**
+ * Returns suggestion names for the add-client picker (not forced onto chambers).
+ */
+export const getClientLotMaster = () => {
+  if (!db) return [...DEFAULT_CLIENT_LOT_MASTER];
+  try {
+    const rows = db.getAllSync(
+      "SELECT client_name FROM client_lot_master ORDER BY client_name COLLATE NOCASE ASC;"
+    );
+    const names = (rows || []).map((r) => r.client_name).filter(Boolean);
+    // Prefer DB suggestions; fall back to defaults for quick-pick UI only
+    const merged = [...names];
+    DEFAULT_CLIENT_LOT_MASTER.forEach((n) => {
+      if (!merged.some((x) => x.toLowerCase() === n.toLowerCase())) merged.push(n);
+    });
+    return merged;
+  } catch (error) {
+    console.error('❌ Failed to read client lot master:', error);
+    return [...DEFAULT_CLIENT_LOT_MASTER];
+  }
+};
+
+/**
+ * Adds a client name to the shared client lot master (appears in all chamber dropdowns).
+ * @returns {boolean} true if inserted or already present
+ */
+export const addClientLotMaster = (clientName) => {
+  if (!db) return false;
+  const name = String(clientName || '').trim();
+  if (!name) return false;
+  try {
+    db.runSync(
+      "INSERT OR IGNORE INTO client_lot_master (client_name) VALUES (?);",
+      [name]
+    );
+    console.log(`🌱 Client lot master: ensured "${name}"`);
+    return true;
+  } catch (error) {
+    console.error('❌ Failed to add client lot master:', error);
+    return false;
   }
 };
 
@@ -406,6 +488,116 @@ export const addLocalAssignment = (chamberId, chamberName, clientName, remark) =
     return true;
   } catch (error) {
     console.error('❌ Failed to add local assignment:', error);
+    return false;
+  }
+};
+
+/**
+ * For each chamber with no active clients yet, seed the default client master list.
+ * After that, DO customizes per chamber (add/edit/delete) and those changes stick.
+ * @returns {number} how many client rows inserted
+ */
+export const seedDefaultClientsForEmptyChambers = (chambers) => {
+  if (!db || !Array.isArray(chambers) || !chambers.length) return 0;
+  let added = 0;
+  for (const ch of chambers) {
+    if (ch?.id == null) continue;
+    const cid = parseInt(ch.id, 10);
+    if (!Number.isFinite(cid)) continue;
+    try {
+      const rows = db.getAllSync(
+        `SELECT client_name FROM local_assignments
+         WHERE chamber_id = ? AND (status IS NULL OR status = 'active')
+         LIMIT 1;`,
+        [cid]
+      );
+      if (rows && rows.length > 0) continue;
+
+      const chamberName = ch.name || `Chamber ${cid}`;
+      for (const name of DEFAULT_CLIENT_LOT_MASTER) {
+        try {
+          db.runSync(
+            `INSERT OR REPLACE INTO local_assignments
+             (chamber_id, chamber_name, client_name, remark, status, sync_status, action)
+             VALUES (?, ?, ?, ?, 'active', 'pending', 'add');`,
+            [cid, chamberName, name, 'Default client master']
+          );
+          added += 1;
+        } catch (_) {}
+      }
+    } catch (err) {
+      console.warn('⚠️ seedDefaultClientsForEmptyChambers failed for chamber', cid, err?.message || err);
+    }
+  }
+  if (added > 0) {
+    console.log(`🌱 Seeded ${added} default client master row(s) on empty chambers.`);
+  }
+  return added;
+};
+
+/**
+ * One-time cleanup: remove auto-seeded "Master client lot" rows so each chamber
+ * only keeps clients the DO explicitly manages.
+ */
+export const purgeAutoSeededMasterLotsOnce = () => {
+  if (!db) return 0;
+  try {
+    const result = db.runSync(
+      "DELETE FROM local_assignments WHERE remark = ?;",
+      ['Master client lot']
+    );
+    const n = result?.changes || 0;
+    if (n > 0) console.log(`🧹 Purged ${n} auto-seeded chamber client lots.`);
+    return n;
+  } catch (error) {
+    console.error('❌ Failed to purge auto-seeded lots:', error);
+    return 0;
+  }
+};
+
+/**
+ * Renames a client assignment on one chamber only (edit client master for that chamber).
+ */
+export const renameLocalAssignment = (chamberId, chamberName, oldClientName, newClientName) => {
+  if (!db) return false;
+  const oldName = String(oldClientName || '').trim();
+  const newName = String(newClientName || '').trim();
+  if (!oldName || !newName) return false;
+  if (oldName.toLowerCase() === newName.toLowerCase()) return true;
+  try {
+    const cid = parseInt(chamberId, 10);
+    const dup = db.getFirstSync(
+      "SELECT id FROM local_assignments WHERE chamber_id = ? AND LOWER(client_name) = LOWER(?) AND (status IS NULL OR status = 'active') LIMIT 1;",
+      [cid, newName]
+    );
+    if (dup) return false;
+
+    const row = db.getFirstSync(
+      "SELECT * FROM local_assignments WHERE chamber_id = ? AND LOWER(client_name) = LOWER(?) LIMIT 1;",
+      [cid, oldName]
+    );
+    if (!row) return false;
+
+    if (row.sync_status === 'pending' && row.action === 'add') {
+      db.runSync(
+        "UPDATE local_assignments SET client_name = ?, chamber_name = COALESCE(?, chamber_name) WHERE chamber_id = ? AND LOWER(client_name) = LOWER(?);",
+        [newName, chamberName || null, cid, oldName]
+      );
+    } else {
+      // Soft-delete old + pending add new (sync-friendly rename)
+      db.runSync(
+        "UPDATE local_assignments SET status = 'inactive', remark = ?, sync_status = 'pending', action = 'delete' WHERE chamber_id = ? AND LOWER(client_name) = LOWER(?);",
+        [`Renamed to ${newName}`, cid, oldName]
+      );
+      db.runSync(
+        "INSERT OR REPLACE INTO local_assignments (chamber_id, chamber_name, client_name, remark, status, sync_status, action) VALUES (?, ?, ?, ?, 'active', 'pending', 'add');",
+        [cid, chamberName || row.chamber_name, newName, `Renamed from ${oldName}`]
+      );
+    }
+    console.log(`✏️ Renamed client on chamber ${cid}: "${oldName}" → "${newName}"`);
+    return true;
+  } catch (error) {
+    console.error('❌ Failed to rename local assignment:', error);
     return false;
   }
 };

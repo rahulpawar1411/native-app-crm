@@ -35,7 +35,12 @@ import {
   deleteInspectionLocally,
   updateInspectionLocally,
   addLocalAssignment,
-  deleteLocalAssignment
+  deleteLocalAssignment,
+  renameLocalAssignment,
+  seedDefaultClientsForEmptyChambers,
+  getClientLotMaster,
+  addClientLotMaster,
+  DEFAULT_CLIENT_LOT_MASTER
 } from '../database/db';
 import { subscribeToSync, triggerSync } from '../services/syncEngine';
 
@@ -48,22 +53,216 @@ Notifications.setNotificationHandler({
   }),
 });
 
-export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
+export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserUpdate }) {
   const displayName = user.full_name || user.email || 'Data Operator';
+  const [chamberLimitOverride, setChamberLimitOverride] = useState(null);
+  const chamberLimit = Math.max(
+    1,
+    parseInt(chamberLimitOverride ?? user?.chamber_limit ?? 4, 10) || 4
+  );
 
-  const reportDOActivity = async (action, description) => {
+  const persistChamberLimit = async (nextLimit) => {
+    const n = parseInt(nextLimit, 10);
+    if (!Number.isFinite(n) || n < 1) return;
+    setChamberLimitOverride(n);
+    try {
+      const nextUser = { ...(user || {}), chamber_limit: n };
+      await AsyncStorage.setItem('user_profile', JSON.stringify(nextUser));
+      if (typeof onUserUpdate === 'function') onUserUpdate(nextUser);
+    } catch (_) {}
+  };
+
+  /** Shared suggestion names for Add Client picker (not auto-forced on chambers). */
+  const [masterClientLots, setMasterClientLots] = useState(() => [...DEFAULT_CLIENT_LOT_MASTER]);
+  const [editingClientName, setEditingClientName] = useState(null); // { chamberId, oldName }
+  const [editClientDraft, setEditClientDraft] = useState('');
+
+  const refreshMasterClientLots = () => {
+    try {
+      setMasterClientLots(getClientLotMaster());
+    } catch (_) {
+      setMasterClientLots([...DEFAULT_CLIENT_LOT_MASTER]);
+    }
+  };
+
+  /** Remember typed name as a future suggestion; does NOT assign to other chambers. */
+  const ensureClientInLotMaster = (rawName) => {
+    const name = String(rawName || '').trim();
+    if (!name) return '';
+    addClientLotMaster(name);
+    refreshMasterClientLots();
+    return name;
+  };
+
+  /** Clients assigned to one chamber only (source of truth for dropdowns / tasks). */
+  const getClientsForChamber = (chamberId, list = assignments) => {
+    if (chamberId == null) return [];
+    return (list || []).filter(
+      (a) =>
+        Number(a.chamber_id) === Number(chamberId) &&
+        a.status !== 'inactive' &&
+        String(a.client_name || '').trim() &&
+        String(a.client_name).toLowerCase() !== 'general'
+    );
+  };
+
+  const refreshPermissionNotifications = async () => {
+    if (!apiUrl || !token) return [];
+    try {
+      const listRes = await fetch(`${apiUrl}/api/permission-requests?_=${Date.now()}`, {
+        headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }
+      });
+      if (listRes.ok) {
+        const listData = await listRes.json().catch(() => []);
+        if (Array.isArray(listData)) {
+          setPermissionNotifications(listData);
+          return listData;
+        }
+      }
+    } catch (_) {}
+    return permissionNotifications;
+  };
+
+  const getChamberClientTarget = (chamberId) => {
+    if (chamberId == null) return null;
+    const raw = chamberClientTargets[String(chamberId)];
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) && n >= 1 ? n : null;
+  };
+
+  const saveChamberClientTarget = async (chamberId, value) => {
+    if (chamberId == null) return null;
+    const digits = String(value ?? '').replace(/[^\d]/g, '');
+    let nextTargets;
+    let savedVal = null;
+    if (!digits) {
+      nextTargets = { ...chamberClientTargets };
+      delete nextTargets[String(chamberId)];
+      setChamberClientTargets(nextTargets);
+      try {
+        await AsyncStorage.setItem('chamber_client_targets', JSON.stringify(nextTargets));
+      } catch (_) {}
+      savedVal = null;
+    } else {
+      const n = Math.max(1, Math.min(50, parseInt(digits, 10) || 1));
+      nextTargets = { ...chamberClientTargets, [String(chamberId)]: n };
+      setChamberClientTargets(nextTargets);
+      try {
+        await AsyncStorage.setItem('chamber_client_targets', JSON.stringify(nextTargets));
+      } catch (_) {}
+      savedVal = n;
+    }
+    // Persist to MySQL so Super Admin / other devices stay in sync
+    try {
+      if (apiUrl && token) {
+        await fetch(`${apiUrl}/api/chambers/${chamberId}`, {
+          method: 'PUT',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+            Accept: 'application/json'
+          },
+          body: JSON.stringify({ total_clients: savedVal })
+        });
+      }
+    } catch (_) {}
+    return savedVal;
+  };
+
+  /** Unique clients logged for chamber + shift on a date */
+  const countLoggedClientsForChamber = (chamberId, shiftName, dateStr, logs = completedLogs) => {
+    const names = new Set();
+    (logs || []).forEach((l) => {
+      if (Number(l.chamber_id) !== Number(chamberId)) return;
+      if (l.entry_date !== dateStr) return;
+      let logShift = l.shift;
+      if (logShift !== 'Morning' && logShift !== 'Evening') {
+        if (l.inspection_time === '16:00' || String(l.inspection_time || '').startsWith('16')) {
+          logShift = 'Evening';
+        } else {
+          logShift = 'Morning';
+        }
+      }
+      if (logShift !== shiftName) return;
+      if (l.client_name) names.add(String(l.client_name).toLowerCase());
+    });
+    return names.size;
+  };
+
+  /** Keep only first N chambers (same rule as Register DO chamber_limit). */
+  const applyChamberLimit = (list) => {
+    const rows = Array.isArray(list) ? [...list] : [];
+    rows.sort((a, b) => {
+      const na = parseInt((String(a.name || '').match(/\d+/) || [a.id])[0], 10);
+      const nb = parseInt((String(b.name || '').match(/\d+/) || [b.id])[0], 10);
+      return na - nb;
+    });
+    return rows.slice(0, chamberLimit);
+  };
+
+  /**
+   * Tasks = only clients assigned to each chamber (chamber-wise master).
+   * Does NOT inject global suggestion names onto every chamber.
+   */
+  const buildTasksForAssignedChambers = (chambers, rawAssignments) => {
+    const chamberRows = Array.isArray(chambers) ? chambers : [];
+    const allowedIds = new Set(chamberRows.map((c) => Number(c.id)));
+    const active = (Array.isArray(rawAssignments) ? rawAssignments : []).filter(
+      (a) =>
+        a &&
+        a.status !== 'inactive' &&
+        allowedIds.has(Number(a.chamber_id)) &&
+        String(a.client_name || '').trim() &&
+        String(a.client_name).toLowerCase() !== 'general'
+    );
+
+    const chamberNameById = new Map(
+      chamberRows.map((c) => [Number(c.id), c.name])
+    );
+
+    const merged = active.map((a) => ({
+      ...a,
+      chamber_name: a.chamber_name || chamberNameById.get(Number(a.chamber_id)) || `Chamber ${a.chamber_id}`
+    }));
+
+    merged.sort((a, b) => {
+      const na = parseInt((String(a.chamber_name || '').match(/\d+/) || [a.chamber_id])[0], 10);
+      const nb = parseInt((String(b.chamber_name || '').match(/\d+/) || [b.chamber_id])[0], 10);
+      if (na !== nb) return na - nb;
+      return String(a.client_name || '').localeCompare(String(b.client_name || ''));
+    });
+    return merged;
+  };
+
+  const reportDOActivity = async (action, description, remark = '') => {
     try {
       if (!apiUrl || !token) return;
+      const desc = String(description || '').trim();
+      if (!action || !desc) return;
+      const remarkFromDesc = (desc.match(/(?:Remark|Remarks?)\s*:\s*(.+)$/im) || [])[1];
+      const resolvedRemark = String(remark || remarkFromDesc || '').trim() || null;
       await fetch(`${apiUrl}/api/operator-activities`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/json'
         },
         body: JSON.stringify({
           action,
-          logType: 'activity',
-          description
+          logType: [
+            'ADD_CLIENT',
+            'DELETE_CLIENT',
+            'UPDATE_CLIENT',
+            'ADD_CHAMBER',
+            'DELETE_CHAMBER',
+            'REQUEST_EDIT',
+            'REQUEST_DELETE'
+          ].includes(String(action))
+            ? 'DO_CHANGE'
+            : 'activity',
+          description: desc,
+          remark: resolvedRemark
         })
       });
     } catch (err) {
@@ -263,9 +462,16 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
   const [showClientDropdown, setShowClientDropdown] = useState(false);
   const [showChamberDropdown, setShowChamberDropdown] = useState(false);
   const [showAddClientModal, setShowAddClientModal] = useState(false);
+  const [showAddChamberModal, setShowAddChamberModal] = useState(false);
+  const [addChamberNameInput, setAddChamberNameInput] = useState('');
+  const [addChamberRemarkInput, setAddChamberRemarkInput] = useState('');
+  const [addChamberBusy, setAddChamberBusy] = useState(false);
   const [inlineClientInput, setInlineClientInput] = useState('');
   const [inlineRemarkInput, setInlineRemarkInput] = useState('');
   const [selectedChamberType, setSelectedChamberType] = useState('Frozen');
+  /** User-typed target: how many clients must be logged for chamber to be fully complete { [chamberId]: 1|2|3|4... } */
+  const [chamberClientTargets, setChamberClientTargets] = useState({});
+  const [totalClientsDraft, setTotalClientsDraft] = useState(''); // form input while modal open
   
   // Custom Client Deletion Reason Modal States
   const [showDeleteConfirmModal, setShowDeleteConfirmModal] = useState(false);
@@ -275,9 +481,14 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
   // Client Master Manager Modal States
   const [showClientManagerModal, setShowClientManagerModal] = useState(false);
   const [managerSelectedChamber, setManagerSelectedChamber] = useState(null);
+  const [masterManagerTab, setMasterManagerTab] = useState('chambers'); // 'chambers' | 'clients'
   const [showManagerChamberDropdown, setShowManagerChamberDropdown] = useState(false);
+  const [showClientSuggestions, setShowClientSuggestions] = useState(false);
   const [newClientInput, setNewClientInput] = useState('');
-  
+  const [newChamberNameInput, setNewChamberNameInput] = useState('');
+  const [masterAccessLoading, setMasterAccessLoading] = useState(false);
+
+  const masterRecordId = user?.id || 1;  
   // Data lists loaded from DB
   const [chambersList, setChambersList] = useState([]);
   const [assignments, setAssignments] = useState([]);
@@ -325,13 +536,14 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
   }, [assignments, completedLogs]);
 
   const completedChambersCount = useMemo(() => {
-    return chambersList.filter(chamber => {
-      const chamberTasks = assignments.filter(item => item.chamber_id === chamber.id && item.status !== 'inactive');
-      if (chamberTasks.length === 0) return false;
-      const chamberLogs = completedLogs.filter(log => log.chamber_id === chamber.id && log.shift === activeShift);
-      return chamberLogs.length === chamberTasks.length;
+    const todayStr = new Date().toISOString().split('T')[0];
+    return chambersList.filter((chamber) => {
+      const target = getChamberClientTarget(chamber.id);
+      if (target == null) return false;
+      const done = countLoggedClientsForChamber(chamber.id, activeShift, todayStr);
+      return done >= target;
     }).length;
-  }, [chambersList, assignments, completedLogs, activeShift]);
+  }, [chambersList, completedLogs, activeShift, chamberClientTargets]);
 
   const getActiveTasksDetails = () => {
     const isEveningUnlocked = new Date().getHours() >= 16;
@@ -450,15 +662,29 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
   // 3. Initialize SQLite DB and Sync Services
   useEffect(() => {
     initDatabase();
-    
-    // Subscribe to network sync events
-    const unsubscribeSync = subscribeToSync(apiUrl, token, (status) => {
-      setSyncStatus(status);
-      loadInspectionsAndSummary(); // Reload logs if sync completes
-    });
+    refreshMasterClientLots();
 
-    // Initial load
-    fetchAndLoadAssignments();
+    let unsubscribeSync = null;
+    (async () => {
+    // Keep legacy purge flag so we don't wipe default masters again; defaults are re-seeded on empty chambers
+    try {
+      await AsyncStorage.setItem('purged_auto_master_lots_v1', '1');
+    } catch (_) {}
+    try {
+      const raw = await AsyncStorage.getItem('chamber_client_targets');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') setChamberClientTargets(parsed);
+      }
+    } catch (_) {}
+
+      unsubscribeSync = subscribeToSync(apiUrl, token, (status) => {
+        setSyncStatus(status);
+        loadInspectionsAndSummary();
+      });
+
+      await fetchAndLoadAssignments();
+    })();
 
     return () => {
       if (unsubscribeSync) unsubscribeSync();
@@ -530,7 +756,10 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
       (n) =>
         !n.do_action_completed_at &&
         (n.status === 'Approved' || n.status === 'Denied') &&
-        n.record_type === 'Chamber'
+        (n.record_type === 'Chamber' ||
+          n.record_type === 'MasterSetup' ||
+          n.record_type === 'ChamberMaster' ||
+          n.record_type === 'ClientMaster')
     );
 
   const markPermissionNotificationComplete = async (notifId) => {
@@ -555,8 +784,538 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
     }
   };
 
+  /** Plus / More → open Chambers & Clients master (add/delete chambers within limit). */
+  const openMasterManager = () => {
+    setManagerSelectedChamber(null);
+    setMasterManagerTab('chambers');
+    setShowManagerChamberDropdown(false);
+    setShowClientSuggestions(false);
+    setNewChamberNameInput('');
+    setNewClientInput('');
+    setEditingClientName(null);
+    setEditClientDraft('');
+    setShowClientManagerModal(true);
+  };
+
+  /** Master Setup opens directly — no Super Admin allow gate */
+  const openMasterManagerWithPermission = async () => {
+    openMasterManager();
+  };
+
+  /** Stable INT for ChamberMaster ADD permission (must match backend). */
+  const chamberAddPermissionId = (name) => {
+    const s = `add|${String(name || '').trim().toLowerCase()}`;
+    let h = 2166136261;
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return (h >>> 0) % 2000000000 || 1;
+  };
+
+  const openAddChamberPopup = () => {
+    // Always open name + remark form; limit is checked when sending request
+    const used = new Set(
+      chambersList.map((c) => {
+        const m = String(c.name || '').match(/^Chamber\s+(\d+)$/i);
+        return m ? parseInt(m[1], 10) : null;
+      }).filter((n) => n != null)
+    );
+    let nextNum = 1;
+    while (used.has(nextNum) && nextNum <= chamberLimit) nextNum += 1;
+    setAddChamberNameInput(chambersList.length >= chamberLimit ? '' : `Chamber ${nextNum}`);
+    setAddChamberRemarkInput('');
+    setShowAddChamberModal(true);
+  };
+
+  const executeChamberCreate = async (name, remark = '', notifIdToComplete = null, options = {}) => {
+    if (!apiUrl || !token) {
+      if (!options.silent) Alert.alert('Offline', 'Connect to server to add a chamber.');
+      return false;
+    }
+    const chamberName = String(name || '').trim();
+    if (!chamberName) {
+      if (!options.silent) Alert.alert('Validation Error', 'Chamber name is required.');
+      return false;
+    }
+    try {
+      const res = await fetch(`${apiUrl}/api/chambers`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json'
+        },
+        body: JSON.stringify({ name: chamberName, remark: String(remark || '').trim() })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        // Permission already used after SA approve — still refresh list from server
+        if (res.status === 403) {
+          await fetchAndLoadAssignments();
+          if (notifIdToComplete) await markPermissionNotificationComplete(notifIdToComplete);
+          if (!options.silent) {
+            Alert.alert(
+              'Chamber Updated',
+              `"${chamberName}" should now appear in your chamber list.`
+            );
+          }
+          return true;
+        }
+        throw new Error(data.message || data.error || 'Failed to add chamber');
+      }
+
+      if (data.chamber_limit != null) {
+        await persistChamberLimit(data.chamber_limit);
+      }
+
+      try {
+        const raw = await AsyncStorage.getItem('pending_chamber_adds');
+        if (raw) {
+          const map = JSON.parse(raw) || {};
+          delete map[String(chamberAddPermissionId(chamberName))];
+          await AsyncStorage.setItem('pending_chamber_adds', JSON.stringify(map));
+        }
+      } catch (_) {}
+
+      await fetchAndLoadAssignments();
+      if (data.data && !options.silent) {
+        setManagerSelectedChamber(data.data);
+        setMasterManagerTab('clients');
+        setShowClientManagerModal(true);
+      }
+      if (notifIdToComplete) {
+        await markPermissionNotificationComplete(notifIdToComplete);
+      }
+      if (!options.silent) {
+        Alert.alert(
+          'Chamber Added',
+          `"${data.data?.name || chamberName}" is assigned. Tasks will use this chamber name with its client master.`
+        );
+      }
+      return true;
+    } catch (err) {
+      if (!options.silent) Alert.alert('Add Chamber', err.message || 'Failed');
+      return false;
+    }
+  };
+
+  // When Super Admin approves Chamber Add, auto-sync chambers on mobile (no need to open bell)
+  const autoSyncedChamberAddsRef = React.useRef(new Set());
+  useEffect(() => {
+    if (!apiUrl || !token) return undefined;
+    const approvedAdds = (permissionNotifications || []).filter((n) => {
+      if (n.record_type !== 'ChamberMaster' || n.status !== 'Approved' || n.do_action_completed_at) {
+        return false;
+      }
+      const text = `${n.request_description || ''} ${n.description || ''}`;
+      return /ADD chamber/i.test(text);
+    });
+    if (!approvedAdds.length) return undefined;
+
+    let cancelled = false;
+    (async () => {
+      for (const notif of approvedAdds) {
+        if (cancelled || autoSyncedChamberAddsRef.current.has(notif.id)) continue;
+        autoSyncedChamberAddsRef.current.add(notif.id);
+        const text = `${notif.request_description || ''} ${notif.description || ''}`;
+        const nameMatch = text.match(/ADD chamber "([^"]+)"/i);
+        const remarkMatch = text.match(/Remark:\s*(.+)$/i);
+        let pending = null;
+        try {
+          const raw = await AsyncStorage.getItem('pending_chamber_adds');
+          const map = raw ? JSON.parse(raw) : {};
+          pending = map[String(notif.record_id)] || null;
+        } catch (_) {}
+        const chamberName = nameMatch?.[1] || pending?.name;
+        if (!chamberName) {
+          await fetchAndLoadAssignments();
+          await markPermissionNotificationComplete(notif.id);
+          continue;
+        }
+        const ok = await executeChamberCreate(
+          chamberName,
+          remarkMatch?.[1]?.trim() || pending?.remark || '',
+          notif.id,
+          { silent: true }
+        );
+        if (ok && !cancelled) {
+          Alert.alert(
+            'Chamber Added',
+            `"${chamberName}" assigned after Super Admin approval.`
+          );
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [permissionNotifications, apiUrl, token]);
+
+  const submitAddChamberRequest = async () => {
+    if (!apiUrl || !token) {
+      Alert.alert('Offline', 'Connect to server to request chamber add.');
+      return;
+    }
+    // Limit is ignored for the request — Super Admin decides on allow
+    const name = String(addChamberNameInput || '').trim();
+    const remark = String(addChamberRemarkInput || '').trim();
+    if (!name) {
+      Alert.alert('Validation Error', 'Please enter a chamber name.');
+      return;
+    }
+    if (!remark) {
+      Alert.alert('Validation Error', 'Please enter a remark / reason.');
+      return;
+    }
+    if (chambersList.some((c) => String(c.name).toLowerCase() === name.toLowerCase())) {
+      Alert.alert('Already exists', `"${name}" is already in your chamber list.`);
+      return;
+    }
+
+    setAddChamberBusy(true);
+    try {
+      const recordId = chamberAddPermissionId(name);
+
+      // If already approved, create immediately
+      const checkRes = await fetch(
+        `${apiUrl}/api/permission-requests/check?record_type=${encodeURIComponent('ChamberMaster')}&record_id=${encodeURIComponent(recordId)}&action=Edit`,
+        { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } }
+      );
+      const checkData = await checkRes.json().catch(() => ({}));
+      if (checkRes.ok && checkData.approved) {
+        setShowAddChamberModal(false);
+        const list = await refreshPermissionNotifications();
+        const granted = (list || []).find(
+          (n) =>
+            n.record_type === 'ChamberMaster' &&
+            Number(n.record_id) === Number(recordId) &&
+            n.status === 'Approved' &&
+            !n.do_action_completed_at
+        );
+        await executeChamberCreate(name, remark, granted?.id || null);
+        return;
+      }
+      if (checkRes.ok && checkData.status === 'Pending') {
+        Alert.alert(
+          'Waiting for Super Admin',
+          `Add request for "${name}" is already pending.`
+        );
+        return;
+      }
+
+      try {
+        const raw = await AsyncStorage.getItem('pending_chamber_adds');
+        const map = raw ? JSON.parse(raw) : {};
+        map[String(recordId)] = { name, remark };
+        await AsyncStorage.setItem('pending_chamber_adds', JSON.stringify(map));
+      } catch (_) {}
+
+      const res = await fetch(`${apiUrl}/api/permission-requests`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json'
+        },
+        body: JSON.stringify({
+          record_type: 'ChamberMaster',
+          record_id: recordId,
+          action: 'Edit',
+          remark,
+          description:
+            `${displayName} requested Super Admin allow to ADD chamber "${name}". Remark: ${remark}`
+        })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        if (data.request?.status === 'Approved') {
+          setShowAddChamberModal(false);
+          await executeChamberCreate(name, remark, null);
+          return;
+        }
+        throw new Error(data.error || data.message || 'Failed to request allow.');
+      }
+
+      setShowAddChamberModal(false);
+      setAddChamberNameInput('');
+      setAddChamberRemarkInput('');
+      await refreshPermissionNotifications();
+      reportDOActivity(
+        'REQUEST_EDIT',
+        `${displayName} requested ADD chamber "${name}". Remark: ${remark}`,
+        remark
+      );
+      Alert.alert(
+        'Request sent to Super Admin',
+        `Allow needed to add "${name}". After Super Admin approves, open notifications (bell) — chamber will assign automatically.`
+      );
+    } catch (err) {
+      Alert.alert('Add Chamber', err.message || 'Could not send request.');
+    } finally {
+      setAddChamberBusy(false);
+    }
+  };
+
+  /** @deprecated — use openAddChamberPopup */
+  const handleCreateChamber = () => {
+    openAddChamberPopup();
+  };
+
+  const executeChamberDelete = async (chamber, notifIdToComplete = null) => {
+    if (!chamber?.id) return false;
+    try {
+      const res = await fetch(`${apiUrl}/api/chambers/${chamber.id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.message || data.error || 'Failed to delete');
+      if (managerSelectedChamber?.id === chamber.id) setManagerSelectedChamber(null);
+      await fetchAndLoadAssignments();
+      if (notifIdToComplete) {
+        await markPermissionNotificationComplete(notifIdToComplete);
+      }
+      reportDOActivity(
+        'DELETE_CHAMBER',
+        `${displayName} deleted chamber "${chamber.name}" (id: ${chamber.id}) after Super Admin allow.`
+      );
+      Alert.alert('Deleted', `"${chamber.name}" removed.`);
+      return true;
+    } catch (err) {
+      Alert.alert('Delete Chamber', err.message || 'Failed');
+      return false;
+    }
+  };
+
+  const requestChamberDeletePermission = async (chamber, remark = '') => {
+    if (!apiUrl || !token || !chamber?.id) {
+      Alert.alert('Offline', 'Connect to server to request delete permission.');
+      return;
+    }
+    const resolvedRemark = String(remark || '').trim();
+    try {
+      const res = await fetch(`${apiUrl}/api/permission-requests`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json'
+        },
+        body: JSON.stringify({
+          record_type: 'ChamberMaster',
+          record_id: chamber.id,
+          action: 'Delete',
+          remark: resolvedRemark || undefined,
+          description:
+            `${displayName} requested Super Admin allow to delete chamber "${chamber.name}" (id: ${chamber.id}).` +
+            (resolvedRemark ? ` Remark: ${resolvedRemark}` : '')
+        })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        if (data.request?.status === 'Approved') {
+          Alert.alert(
+            'Already Approved',
+            `Delete of "${chamber.name}" is already allowed. Tap Delete again to remove it.`
+          );
+          return;
+        }
+        throw new Error(data.error || data.message || 'Failed to request delete permission.');
+      }
+      reportDOActivity(
+        'REQUEST_DELETE',
+        `${displayName} requested delete chamber "${chamber.name}" (id: ${chamber.id}).` +
+          (resolvedRemark ? ` Remark: ${resolvedRemark}` : ''),
+        resolvedRemark
+      );
+      Alert.alert(
+        'Request sent to Super Admin',
+        `Allow needed to delete "${chamber.name}". After Super Admin approves, open notifications (bell) or tap Delete again.`
+      );
+      // Refresh permission notifications
+      try {
+        const listRes = await fetch(`${apiUrl}/api/permission-requests?_=${Date.now()}`, {
+          headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }
+        });
+        if (listRes.ok) {
+          const listData = await listRes.json().catch(() => []);
+          if (Array.isArray(listData)) setPermissionNotifications(listData);
+        }
+      } catch (_) {}
+    } catch (err) {
+      Alert.alert('Delete Permission', err.message || 'Could not send request.');
+    }
+  };
+
+  const handleDeleteChamberMaster = (chamber) => {
+    if (!chamber?.id) return;
+    if (!apiUrl || !token) {
+      Alert.alert('Offline', 'Connect to server to delete a chamber.');
+      return;
+    }
+
+    (async () => {
+      try {
+        const checkRes = await fetch(
+          `${apiUrl}/api/permission-requests/check?record_type=${encodeURIComponent('ChamberMaster')}&record_id=${encodeURIComponent(chamber.id)}&action=Delete`,
+          { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } }
+        );
+        const checkData = await checkRes.json().catch(() => ({}));
+        if (!checkRes.ok) {
+          throw new Error(checkData.error || checkData.message || 'Permission check failed');
+        }
+
+        if (checkData.approved) {
+          Alert.alert(
+            'Delete Chamber',
+            `Super Admin allowed delete. Remove "${chamber.name}" and deactivate its clients?`,
+            [
+              { text: 'Cancel', style: 'cancel' },
+              {
+                text: 'Delete',
+                style: 'destructive',
+                onPress: async () => {
+                  const granted = permissionNotifications.find(
+                    (n) =>
+                      n.record_type === 'ChamberMaster' &&
+                      Number(n.record_id) === Number(chamber.id) &&
+                      n.status === 'Approved' &&
+                      !n.do_action_completed_at
+                  );
+                  await executeChamberDelete(chamber, granted?.id || null);
+                }
+              }
+            ]
+          );
+          return;
+        }
+
+        if (checkData.status === 'Pending') {
+          Alert.alert(
+            'Waiting for Super Admin',
+            `Delete request for "${chamber.name}" is pending. Super Admin will approve in Role & Permission.`
+          );
+          return;
+        }
+
+        Alert.alert(
+          'Super Admin Permission Required',
+          `Deleting "${chamber.name}" needs Super Admin allow. Enter remark and send request.`,
+          [
+            { text: 'Cancel', style: 'cancel' },
+            {
+              text: 'Continue',
+              onPress: () => {
+                setClientToDelete({
+                  type: 'chamber_delete_request',
+                  chamberId: chamber.id,
+                  chamberName: chamber.name,
+                  clientName: chamber.name
+                });
+                setDeleteRemarkInput('');
+                setShowDeleteConfirmModal(true);
+              }
+            }
+          ]
+        );
+      } catch (err) {
+        Alert.alert('Delete Chamber', err.message || 'Could not check permission.');
+      }
+    })();
+  };
+
   const openPermissionNotificationTask = async (notif) => {
     setShowNotificationsModal(false);
+
+    // Master Setup — no allow gate; open manager and dismiss stale allow notifs
+    if (notif.record_type === 'MasterSetup') {
+      openMasterManager();
+      await markPermissionNotificationComplete(notif.id);
+      return;
+    }
+
+    // Chamber master add/delete allow
+    if (notif.record_type === 'ChamberMaster') {
+      const desc = String(notif.description || notif.request_description || '');
+      const isAdd = /ADD chamber/i.test(desc);
+
+      if (isAdd) {
+        const nameMatch = desc.match(/ADD chamber "([^"]+)"/i);
+        const remarkMatch = desc.match(/Remark:\s*(.+)$/i);
+        let pending = null;
+        try {
+          const raw = await AsyncStorage.getItem('pending_chamber_adds');
+          const map = raw ? JSON.parse(raw) : {};
+          pending = map[String(notif.record_id)] || null;
+        } catch (_) {}
+        const chamberName = nameMatch?.[1] || pending?.name;
+        const remark = remarkMatch?.[1]?.trim() || pending?.remark || '';
+
+        if (notif.status === 'Approved') {
+          if (!chamberName) {
+            await fetchAndLoadAssignments();
+            Alert.alert('Chamber Updated', 'Your chamber list was refreshed after Super Admin approval.');
+            await markPermissionNotificationComplete(notif.id);
+            return;
+          }
+          // SA already created chamber + bumped limit; POST is idempotent and refreshes mobile
+          await executeChamberCreate(chamberName, remark, notif.id);
+        } else {
+          Alert.alert(
+            'Add Denied',
+            desc || `Super Admin denied add of "${chamberName || 'chamber'}".`
+          );
+          await markPermissionNotificationComplete(notif.id);
+        }
+        return;
+      }
+
+      const chamberId = Number(notif.record_id);
+      const nameMatch = desc.match(/delete chamber "([^"]+)"/i);
+      const found = chambersList.find((c) => Number(c.id) === chamberId);
+      const chamber = {
+        id: chamberId,
+        name: nameMatch?.[1] || found?.name || `Chamber ${chamberId}`
+      };
+
+      if (notif.status === 'Approved') {
+        Alert.alert(
+          'Delete Approved',
+          `Super Admin allowed delete of "${chamber.name}". Remove it now?`,
+          [
+            { text: 'Later', style: 'cancel' },
+            {
+              text: 'Delete Now',
+              style: 'destructive',
+              onPress: () => executeChamberDelete(chamber, notif.id)
+            }
+          ]
+        );
+      } else {
+        Alert.alert(
+          'Delete Denied',
+          notif.description || `Super Admin denied delete of "${chamber.name}".`
+        );
+        await markPermissionNotificationComplete(notif.id);
+      }
+      return;
+    }
+
+    // Client master — notify only (already applied locally). No SA allow apply step.
+    if (notif.record_type === 'ClientMaster') {
+      Alert.alert(
+        'Client Master',
+        'Client master changes are saved immediately. Super Admin is notified only — no allow step.'
+      );
+      await markPermissionNotificationComplete(notif.id);
+      try {
+        await AsyncStorage.removeItem('pending_client_master_edits');
+      } catch (_) {}
+      return;
+    }
+
     const meta = parsePermissionTaskMeta(notif);
     const shiftName = meta.shift || 'Morning';
     const shiftTime = shiftName === 'Evening' ? '16:00' : '10:00';
@@ -617,6 +1376,8 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
   };
 
   const fetchAndLoadAssignments = async () => {
+    let loadedChambers = null;
+    let sessionRevoked = false;
     try {
       const response = await fetch(`${apiUrl}/api/chambers/assignments`, {
         headers: {
@@ -625,6 +1386,7 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
       });
 
       if (response.status === 401 || response.status === 403) {
+        sessionRevoked = true;
         Alert.alert(
           'Session Revoked',
           'Your account has been deleted or disabled. Logging you out.',
@@ -635,35 +1397,193 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
 
       const data = await response.json();
       
-      if (data.success && data.data) {
+      if (data.success && Array.isArray(data.data)) {
         cacheAssignments(data.data);
       }
+
+      // Load Chamber 1..N; create any missing so dashboard always has tasks
+      loadedChambers = await ensureAssignedChambersFromServer();
     } catch (err) {
       console.log('📶 Device is offline or server unreachable. Using cached assignments.');
     } finally {
-      loadLocalAssignmentsData();
+      if (!sessionRevoked) {
+        loadLocalAssignmentsData(loadedChambers);
+      } else {
+        setIsLoadingData(false);
+      }
     }
   };
 
-  const loadLocalAssignmentsData = () => {
-    const cachedData = getLocalAssignments();
-    setAssignments(cachedData);
+  /** Fetch chambers for this DO; create Chamber 1..limit if missing; never return empty if limit > 0. */
+  const ensureAssignedChambersFromServer = async () => {
+    const limit = chamberLimit;
+    const authHeaders = {
+      Authorization: `Bearer ${token}`,
+      Accept: 'application/json',
+      'Content-Type': 'application/json'
+    };
 
-    const uniqueChambers = [];
-    const tracker = new Set();
-    
-    cachedData.forEach(item => {
-      if (!tracker.has(item.chamber_id)) {
-        tracker.add(item.chamber_id);
-        uniqueChambers.push({
-          id: item.chamber_id,
-          name: item.chamber_name
-        });
+    const parseChamberRows = (chData) => {
+      const rows = Array.isArray(chData?.data) ? chData.data : (Array.isArray(chData) ? chData : []);
+      return rows.map((c) => ({
+        id: Number(c.id),
+        name: c.name || c.chamber_name || `Chamber ${c.id}`,
+        total_clients:
+          c.total_clients != null && c.total_clients !== ''
+            ? parseInt(c.total_clients, 10)
+            : null
+      }));
+    };
+
+    const applyServerTotalClients = async (chambers) => {
+      if (!Array.isArray(chambers) || !chambers.length) return;
+      let merged = {};
+      try {
+        const raw = await AsyncStorage.getItem('chamber_client_targets');
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === 'object') merged = { ...parsed };
+        }
+      } catch (_) {}
+      let changed = false;
+      chambers.forEach((c) => {
+        if (c.id == null) return;
+        const key = String(c.id);
+        if (c.total_clients != null && Number.isFinite(c.total_clients) && c.total_clients >= 1) {
+          if (Number(merged[key]) !== Number(c.total_clients)) {
+            merged[key] = c.total_clients;
+            changed = true;
+          }
+        }
+      });
+      if (changed || Object.keys(merged).length) {
+        setChamberClientTargets(merged);
+        if (changed) {
+          try {
+            await AsyncStorage.setItem('chamber_client_targets', JSON.stringify(merged));
+          } catch (_) {}
+        }
       }
-    });
+    };
 
-    setChambersList(uniqueChambers);
-    loadInspectionsAndSummary(cachedData, uniqueChambers);
+    const fetchChambers = async () => {
+      const chRes = await fetch(`${apiUrl}/api/chambers`, { headers: authHeaders });
+      if (!chRes.ok) return [];
+      const chData = await chRes.json().catch(() => ({}));
+      const serverLimit = parseInt(chData?.chamber_limit, 10);
+      const effectiveLimit =
+        Number.isFinite(serverLimit) && serverLimit > 0 ? serverLimit : limit;
+      if (Number.isFinite(serverLimit) && serverLimit > 0 && serverLimit !== chamberLimit) {
+        persistChamberLimit(serverLimit);
+      }
+      const sorted = parseChamberRows(chData).sort((a, b) => {
+        const na = parseInt((String(a.name || '').match(/\d+/) || [a.id])[0], 10);
+        const nb = parseInt((String(b.name || '').match(/\d+/) || [b.id])[0], 10);
+        return na - nb;
+      });
+      return { chambers: sorted.slice(0, effectiveLimit), effectiveLimit };
+    };
+
+    let chambers = [];
+    let effectiveLimit = limit;
+    try {
+      const first = await fetchChambers();
+      chambers = first.chambers || [];
+      effectiveLimit = first.effectiveLimit || limit;
+    } catch (_) {
+      chambers = [];
+    }
+
+    // Bootstrap only when empty — do not recreate chambers the user deleted
+    if (!chambers.length && effectiveLimit > 0) {
+      for (let i = 1; i <= effectiveLimit; i++) {
+        try {
+          const res = await fetch(`${apiUrl}/api/chambers`, {
+            method: 'POST',
+            headers: authHeaders,
+            body: JSON.stringify({ name: `Chamber ${i}` })
+          });
+          const body = await res.json().catch(() => ({}));
+          if (res.ok && body?.data?.id) {
+            chambers.push({
+              id: Number(body.data.id),
+              name: body.data.name || `Chamber ${i}`,
+              total_clients: body.data.total_clients != null ? parseInt(body.data.total_clients, 10) : null
+            });
+          }
+        } catch (_) {}
+      }
+      try {
+        const again = await fetchChambers();
+        if (again.chambers?.length) {
+          chambers = again.chambers;
+          effectiveLimit = again.effectiveLimit || effectiveLimit;
+        }
+      } catch (_) {}
+    }
+
+    // Last resort: local placeholders so dashboard is never empty for assigned limit
+    if (!chambers.length && effectiveLimit > 0) {
+      chambers = Array.from({ length: effectiveLimit }, (_, idx) => ({
+        id: idx + 1,
+        name: `Chamber ${idx + 1}`,
+        total_clients: null
+      }));
+    }
+
+    await applyServerTotalClients(chambers);
+
+    return applyChamberLimit(chambers).slice(0, effectiveLimit);
+  };
+
+  const loadLocalAssignmentsData = (chambersOverride = null) => {
+    let chambers = applyChamberLimit(
+      Array.isArray(chambersOverride) && chambersOverride.length
+        ? chambersOverride
+        : (chambersList || [])
+    );
+
+    let cachedData = getLocalAssignments();
+
+    if (chambers.length === 0) {
+      const fromAssign = [];
+      const tracker = new Set();
+      cachedData.forEach((item) => {
+        if (!tracker.has(Number(item.chamber_id))) {
+          tracker.add(Number(item.chamber_id));
+          fromAssign.push({ id: item.chamber_id, name: item.chamber_name });
+        }
+      });
+      chambers = applyChamberLimit(fromAssign);
+    }
+
+    // Still empty → show Chamber 1..limit so tasks appear on dashboard
+    if (chambers.length === 0 && chamberLimit > 0) {
+      chambers = Array.from({ length: chamberLimit }, (_, idx) => ({
+        id: idx + 1,
+        name: `Chamber ${idx + 1}`
+      }));
+    }
+
+    // Empty chambers get default client master; user can edit per chamber later
+    const seeded = seedDefaultClientsForEmptyChambers(chambers);
+    if (seeded > 0) {
+      cachedData = getLocalAssignments();
+      if (apiUrl && token) {
+        try {
+          triggerSync(apiUrl, token, setSyncStatus);
+        } catch (_) {}
+      }
+    }
+
+    const lots = getClientLotMaster();
+    setMasterClientLots(lots);
+
+    const finalTasks = buildTasksForAssignedChambers(chambers, cachedData);
+
+    setChambersList(chambers);
+    setAssignments(finalTasks);
+    loadInspectionsAndSummary(finalTasks, chambers);
   };
 
   const loadInspectionsAndSummary = (currAssignments = assignments, currChambers = chambersList) => {
@@ -861,6 +1781,13 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
     }
     if (!selectedClient) {
       Alert.alert('Validation Error', 'Please select a Client.');
+      return;
+    }
+    if (!editingExistingLog && getChamberClientTarget(selectedChamber.id) == null) {
+      Alert.alert(
+        'Total Clients required',
+        'Type Total Clients (1, 2, 3, or 4) first. Chamber completes after that many client submits.'
+      );
       return;
     }
     if (!tempInput || isNaN(parseFloat(tempInput))) {
@@ -1073,22 +2000,54 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
     const success = saveInspectionLocally(newLog);
     if (success) {
       setShowLogModal(false);
-      setSelectedClient(null);
       setCapturedImage(null);
       setCapturedImageTimestamp(null);
-      
+
+      const target = getChamberClientTarget(selectedChamber.id);
+      const todaysAfterSave = getTodaysInspections(targetDate, displayName);
+      const doneAfter = countLoggedClientsForChamber(
+        selectedChamber.id,
+        targetShiftName,
+        targetDate,
+        todaysAfterSave
+      );
+      const totalClients = target != null ? target : 0;
+      const chamberFullyDone = target != null && doneAfter >= target;
+      const remaining = target != null ? Math.max(0, target - doneAfter) : 0;
+
       if (currentNavTab === 'Dashboard' || openedFromFab) {
         setSelectedChamber(null);
         setOpenedFromFab(false);
+        setSelectedClient(null);
       }
-      
-      setActiveTab('Completed');
-      loadInspectionsAndSummary(); // Refresh SQLite states
-      
+
+      if (chamberFullyDone) {
+        setActiveTab('Completed');
+        setSelectedClient(null);
+      } else {
+        setActiveTab('Pending');
+      }
+
+      loadInspectionsAndSummary();
+
       Alert.alert(
-        'Inspection Saved Locally',
-        'Log saved to device queue. It will auto-sync once the network is connected.',
-        [{ text: 'OK' }]
+        'Inspection Saved',
+        target == null
+          ? `Saved "${selectedClient}". Set Total Clients (1–4) so chamber can complete.`
+          : chamberFullyDone
+            ? `All ${totalClients} client(s) logged for ${selectedChamber.name}. Chamber completed.`
+            : `Saved "${selectedClient}". ${doneAfter}/${totalClients} done — ${remaining} more needed.`,
+        [
+          { text: 'OK' },
+          ...(!chamberFullyDone && target != null && remaining > 0 && currentNavTab === 'Tasks'
+            ? [
+                {
+                  text: 'Next Client',
+                  onPress: () => handleOpenChamberLogFormDirect(selectedChamber)
+                }
+              ]
+            : [])
+        ]
       );
 
       triggerSync(apiUrl, token, (status) => {
@@ -1106,6 +2065,8 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
     setCapturedImageTimestamp(null);
     setEditingExistingLog(null);
     setUpdateTimeInput('');
+    setShowChamberDropdown(false);
+    setShowClientDropdown(false);
     if (currentNavTab === 'Dashboard' || openedFromFab) {
       setSelectedChamber(null);
       setOpenedFromFab(false);
@@ -1122,37 +2083,92 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
       Alert.alert('Validation Error', 'Please enter a Client Lot Name.');
       return;
     }
-    const clientName = newClientInput.trim();
-
-    const duplicateExists = assignments.some(
-      item => item.chamber_id === managerSelectedChamber.id && item.client_name.toLowerCase() === clientName.toLowerCase()
-    );
-    if (duplicateExists) {
-      Alert.alert('Duplicate Client', `"${clientName}" is already assigned to ${managerSelectedChamber.name}.`);
+    const clientName = ensureClientInLotMaster(newClientInput);
+    if (!clientName) {
+      Alert.alert('Validation Error', 'Please enter a Client Lot Name.');
       return;
     }
 
-    const success = addLocalAssignment(managerSelectedChamber.id, managerSelectedChamber.name, clientName, 'Added from master panel');
+    const duplicateExists = getClientsForChamber(managerSelectedChamber.id).some(
+      (item) => item.client_name.toLowerCase() === clientName.toLowerCase()
+    );
+    if (duplicateExists) {
+      Alert.alert('Already on chamber', `"${clientName}" is already on ${managerSelectedChamber.name}.`);
+      return;
+    }
+
+    const success = addLocalAssignment(
+      managerSelectedChamber.id,
+      managerSelectedChamber.name,
+      clientName,
+      'Added for this chamber only'
+    );
     if (success) {
       setNewClientInput('');
-      loadLocalAssignmentsData(); 
-      reportDOActivity('ADD_CLIENT', `Added client "${clientName}" to ${managerSelectedChamber.name} with remark: Added from master panel`);
+      loadLocalAssignmentsData(chambersList);
+      reportDOActivity('ADD_CLIENT', `Added client "${clientName}" to ${managerSelectedChamber.name} only`, 'Added for this chamber only');
       if (apiUrl && token) triggerSync(apiUrl, token, setSyncStatus);
-      Alert.alert('Success', `Successfully added client "${clientName}" to ${managerSelectedChamber.name}.`);
+      Alert.alert('Success', `"${clientName}" added to ${managerSelectedChamber.name} only.`);
     } else {
-      Alert.alert('Error', 'Failed to add client to local SQLite assignments master.');
+      Alert.alert('Error', 'Failed to add client to this chamber.');
     }
   };
 
-  const handleDeleteClient = (clientName) => {
-    if (!managerSelectedChamber) return;
+  const handleRenameChamberClient = async () => {
+    if (!managerSelectedChamber || !editingClientName) return;
+    const oldName = editingClientName.oldName;
+    const newName = String(editClientDraft || '').trim();
+    if (!newName) {
+      Alert.alert('Validation Error', 'Enter a new client name.');
+      return;
+    }
+    if (newName.toLowerCase() === String(oldName).toLowerCase()) {
+      setEditingClientName(null);
+      setEditClientDraft('');
+      return;
+    }
+
+    const ok = renameLocalAssignment(
+      managerSelectedChamber.id,
+      managerSelectedChamber.name,
+      oldName,
+      newName
+    );
+    if (!ok) {
+      Alert.alert('Rename failed', 'Name may already exist on this chamber.');
+      return;
+    }
+    ensureClientInLotMaster(newName);
+    setEditingClientName(null);
+    setEditClientDraft('');
+    loadLocalAssignmentsData(chambersList);
+    // Notify Super Admin only — no allow request
+    reportDOActivity(
+      'UPDATE_CLIENT',
+      `${displayName} edited client master "${oldName}" → "${newName}" on ${managerSelectedChamber.name} (chamber_id: ${managerSelectedChamber.id}).`,
+      `Renamed "${oldName}" to "${newName}"`
+    );
+    if (apiUrl && token) triggerSync(apiUrl, token, setSyncStatus);
+    Alert.alert('Updated', `"${oldName}" renamed to "${newName}". Super Admin has been notified.`);
+  };
+
+  const handleDeleteClient = (clientName, chamberOverride = null) => {
+    const chamber = chamberOverride || managerSelectedChamber;
+    if (!chamber || !clientName) return;
     setClientToDelete({
-      chamberId: managerSelectedChamber.id,
-      clientName: clientName,
-      chamberName: managerSelectedChamber.name
+      chamberId: chamber.id,
+      chamberName: chamber.name,
+      clientName
     });
     setDeleteRemarkInput('');
     setShowDeleteConfirmModal(true);
+  };
+
+  /** Delete client master from task form (same flow as Master Setup). */
+  const openDeleteClientFromTaskForm = (clientName) => {
+    if (!selectedChamber || !clientName) return;
+    setShowClientDropdown(false);
+    handleDeleteClient(clientName, selectedChamber);
   };
 
   // Chamber type classification
@@ -1172,7 +2188,7 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
   // Details for Chamber Grid cards
   const getChamberDetails = (chamber) => {
     const pattern = getChamberTypeAndDefault(chamber.id);
-    const chamberLogs = completedLogs.filter(log => log.chamber_id === chamber.id && log.shift === activeShift);
+    const chamberLogs = completedLogs.filter(log => Number(log.chamber_id) === Number(chamber.id) && log.shift === activeShift);
     const hasLogs = chamberLogs.length > 0;
     
     const tempVal = hasLogs ? chamberLogs[chamberLogs.length - 1].box_temp : null;
@@ -1186,7 +2202,7 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
     let pillBg = pattern.bg;
     let hasAlert = false;
 
-    const chamberAssignments = assignments.filter(item => item.chamber_id === chamber.id);
+    const chamberAssignments = assignments.filter(item => Number(item.chamber_id) === Number(chamber.id));
     const completedCount = chamberLogs.length;
     const totalCount = chamberAssignments.length;
 
@@ -1217,21 +2233,24 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
 
   // Filters Chambers List based on stats tab clicks
   const getFilteredChambers = () => {
+    const todayStr = new Date().toISOString().split('T')[0];
     if (activeTab === 'All') return chambersList;
     return chambersList.filter(chamber => {
-      const chamberTasks = assignments.filter(item => item.chamber_id === chamber.id && item.status !== 'inactive');
-      const chamberLogs = completedLogs.filter(log => log.chamber_id === chamber.id && log.shift === activeShift);
-      const isCompleted = chamberLogs.length === chamberTasks.length && chamberTasks.length > 0;
+      const target = getChamberClientTarget(chamber.id);
+      const done = countLoggedClientsForChamber(chamber.id, activeShift, todayStr);
+      const isCompleted = target != null && done >= target;
 
       if (activeTab === 'Pending') {
-        const activeChamberTasks = chamberTasks.filter(t => t.status !== 'inactive');
-        return activeChamberTasks.length > 0 && chamberLogs.length < activeChamberTasks.length;
+        return !isCompleted;
       }
       if (activeTab === 'Completed') {
         return isCompleted;
       }
       if (activeTab === 'Failed') {
         const pattern = getChamberTypeAndDefault(chamber.id);
+        const chamberLogs = completedLogs.filter(
+          (log) => Number(log.chamber_id) === Number(chamber.id) && log.shift === activeShift
+        );
         return chamberLogs.some(log => {
           if (pattern.type === 'Frozen') return log.box_temp > -18;
           if (pattern.type === 'Chilled') return log.box_temp < -5 || log.box_temp > 5;
@@ -1270,9 +2289,9 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
 
     return shiftTasks.filter(item => {
       const todayStr = new Date().toISOString().split('T')[0];
-      const log = completedLogs.find(l => 
-        l.chamber_id === item.chamber_id && 
-        l.client_name === item.client_name && 
+      const log = completedLogs.find(l =>
+        Number(l.chamber_id) === Number(item.chamber_id) &&
+        l.client_name === item.client_name &&
         l.entry_date === todayStr &&
         l.shift === (item.shift_time === '10:00' ? 'Morning' : 'Evening')
       );
@@ -1294,6 +2313,99 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
         return isCompleted;
       }
       return true;
+    });
+  };
+
+  /**
+   * Tasks screen list:
+   * - All / Pending / Overdue → one row per chamber (+ shift)
+   * - Completed → one row per client lot (logged)
+   */
+  const getTasksScreenList = (targetTab = activeTab) => {
+    // Completed = client-wise
+    if (targetTab === 'Completed') {
+      return getFilteredAssignments('Completed').map((item) => ({
+        ...item,
+        _view: 'client',
+        is_chamber_task: false
+      }));
+    }
+
+    const todayStr = new Date().toISOString().split('T')[0];
+    const currentHour = new Date().getHours();
+    const shifts = [{ time: '10:00', label: 'Morning Task', name: 'Morning' }];
+    if (currentHour >= 16) {
+      shifts.push({ time: '16:00', label: 'Evening Task', name: 'Evening' });
+    }
+
+    // Overdue = chamber-wise (group missed client rows)
+    if (targetTab === 'Overdue') {
+      const map = new Map();
+      overdueTasks.forEach((t) => {
+        const key = `${t.chamber_id}_${t.due_date}_${t.shift_time || t.shift || ''}`;
+        if (!map.has(key)) {
+          map.set(key, {
+            _view: 'chamber',
+            is_chamber_task: true,
+            is_overdue: true,
+            chamber_id: t.chamber_id,
+            chamber_name: t.chamber_name,
+            client_name: null,
+            due_date: t.due_date,
+            shift_time: t.shift_time || (t.shift === 'Evening' ? '16:00' : '10:00'),
+            shift_label: t.shift_label || (t.shift === 'Evening' ? 'Evening Task' : 'Morning Task'),
+            clients_total: 0,
+            clients_done: 0,
+            is_completed: false
+          });
+        }
+        map.get(key).clients_total += 1;
+      });
+      return Array.from(map.values()).sort((a, b) => {
+        const na = parseInt((String(a.chamber_name || '').match(/\d+/) || [a.chamber_id])[0], 10);
+        const nb = parseInt((String(b.chamber_name || '').match(/\d+/) || [b.chamber_id])[0], 10);
+        if (String(a.due_date) !== String(b.due_date)) {
+          return String(b.due_date).localeCompare(String(a.due_date));
+        }
+        return na - nb;
+      });
+    }
+
+    // All / Pending = chamber-wise for active shift slots
+    const rows = [];
+    chambersList.forEach((ch) => {
+      shifts.forEach((shift) => {
+        const target = getChamberClientTarget(ch.id);
+        const doneCount = countLoggedClientsForChamber(ch.id, shift.name, todayStr);
+        // User-typed total (1,2,3,4…) — chamber complete only when logged >= target
+        const clientsTotal = target != null ? target : 0;
+        const isDone = target != null && doneCount >= target;
+
+        if (targetTab === 'Pending' && isDone) return;
+        if (targetTab === 'All' || targetTab === 'Pending') {
+          rows.push({
+            _view: 'chamber',
+            is_chamber_task: true,
+            chamber_id: ch.id,
+            chamber_name: ch.name,
+            client_name: null,
+            shift_time: shift.time,
+            shift_label: shift.label,
+            clients_total: clientsTotal,
+            clients_done: doneCount,
+            target_set: target != null,
+            is_completed: isDone,
+            is_overdue: false
+          });
+        }
+      });
+    });
+
+    return rows.sort((a, b) => {
+      const na = parseInt((String(a.chamber_name || '').match(/\d+/) || [a.chamber_id])[0], 10);
+      const nb = parseInt((String(b.chamber_name || '').match(/\d+/) || [b.chamber_id])[0], 10);
+      if (na !== nb) return na - nb;
+      return String(a.shift_time).localeCompare(String(b.shift_time));
     });
   };
 
@@ -1600,17 +2712,24 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
 
   const handleOpenChamberLogFormDirect = (chamber) => {
     if (!chamber) return;
-    
-    const chamberClients = assignments.filter(item => item.chamber_id === chamber.id && item.status !== 'inactive');
-    const unloggedClient = chamberClients.find(item => !isClientCompletedToday(chamber.id, item.client_name));
-    
-    if (!unloggedClient) {
-      Alert.alert('Chamber Completed', 'All clients in this chamber have already been logged today.');
+
+    const todayStr = new Date().toISOString().split('T')[0];
+    const target = getChamberClientTarget(chamber.id);
+    const done = countLoggedClientsForChamber(chamber.id, activeShift, todayStr);
+    if (target != null && done >= target) {
+      Alert.alert('Chamber Completed', `All ${target} client(s) already logged for this chamber.`);
       return;
     }
     
+    const chamberClients = assignments.filter(item => Number(item.chamber_id) === Number(chamber.id) && item.status !== 'inactive');
+    const unloggedClient =
+      chamberClients.find(item => !isClientCompletedToday(chamber.id, item.client_name)) ||
+      chamberClients[0] ||
+      { client_name: masterClientLots[0] || 'General' };
+    
     setSelectedChamber(chamber);
     setSelectedClient(unloggedClient.client_name);
+    setTotalClientsDraft(target != null ? String(target) : '');
     setTempInput('');
     setBoxCountInput('');
     setCapturedImage(null);
@@ -1834,7 +2953,7 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
             </TouchableOpacity>
           </View>
           <View style={styles.metricsRow}>
-            {/* 0. All Tasks Card (Blue tint) */}
+            {/* 0. All Tasks Card — chamber count */}
             <TouchableOpacity 
               style={[
                 styles.metricCard, 
@@ -1848,13 +2967,13 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
                 <Ionicons name="list" size={18} color="#2563eb" />
               </View>
               <Text style={[styles.metricValue, { color: '#2563eb' }]}>
-                {assignments.filter(item => item.status !== 'inactive').length}
+                {chambersList.length}
               </Text>
               <Text style={styles.metricLabel}>All Tasks</Text>
-              <Text style={styles.metricSubtitle}>Active Task</Text>
+              <Text style={styles.metricSubtitle}>Chambers</Text>
             </TouchableOpacity>
 
-            {/* 2. Pending Tasks Card (Yellow tint) */}
+            {/* 2. Pending Tasks Card — pending chambers */}
             <TouchableOpacity 
               style={[
                 styles.metricCard, 
@@ -1867,12 +2986,14 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
               <View style={[styles.metricIconCircle, { backgroundColor: '#fef3c7' }]}>
                 <Ionicons name="document-text" size={18} color="#d97706" />
               </View>
-              <Text style={[styles.metricValue, { color: '#d97706' }]}>{pendingCount}</Text>
-              <Text style={styles.metricLabel}>Pending Tasks</Text>
-              <Text style={styles.metricSubtitle}>To Be Done</Text>
+              <Text style={[styles.metricValue, { color: '#d97706' }]}>
+                {Math.max(0, chambersList.length - completedChambersCount)}
+              </Text>
+              <Text style={styles.metricLabel}>Pending</Text>
+              <Text style={styles.metricSubtitle}>Chambers</Text>
             </TouchableOpacity>
 
-            {/* 3. Completed Card (Green tint) */}
+            {/* 3. Completed Card — completed chambers */}
             <TouchableOpacity 
               style={[
                 styles.metricCard, 
@@ -1889,10 +3010,10 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
                 {completedChambersCount}
               </Text>
               <Text style={styles.metricLabel}>Completed</Text>
-              <Text style={styles.metricSubtitle}>Today</Text>
+              <Text style={styles.metricSubtitle}>Chambers</Text>
             </TouchableOpacity>
 
-            {/* 4. Overdue Tasks Card (Gray tint) */}
+            {/* 4. Overdue — unique overdue chambers */}
             <TouchableOpacity 
               style={[
                 styles.metricCard, 
@@ -1905,9 +3026,11 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
               <View style={[styles.metricIconCircle, { backgroundColor: '#e2e8f0' }]}>
                 <Ionicons name="time" size={18} color="#64748b" />
               </View>
-              <Text style={[styles.metricValue, { color: '#64748b' }]}>{overdueCount}</Text>
+              <Text style={[styles.metricValue, { color: '#64748b' }]}>
+                {new Set(overdueTasks.map((t) => Number(t.chamber_id))).size}
+              </Text>
               <Text style={styles.metricLabel}>Overdue</Text>
-              <Text style={styles.metricSubtitle}>Tasks</Text>
+              <Text style={styles.metricSubtitle}>Chambers</Text>
             </TouchableOpacity>
           </View>
         </View>
@@ -1929,9 +3052,10 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
           ) : (
             getFilteredChambers().map((chamber) => {
               const details = getChamberDetails(chamber);
-              const chamberTasks = assignments.filter(item => item.chamber_id === chamber.id);
-              const completedChamberLogs = completedLogs.filter(log => log.chamber_id === chamber.id);
-              const clientNames = Array.from(new Set(chamberTasks.map(t => t.client_name).filter(Boolean))).join(', ');
+              const todayStr = new Date().toISOString().split('T')[0];
+              const target = getChamberClientTarget(chamber.id);
+              const doneCount = countLoggedClientsForChamber(chamber.id, activeShift, todayStr);
+              const isDone = target != null && doneCount >= target;
 
               return (
                 <TouchableOpacity
@@ -1943,7 +3067,7 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
                   onPress={() => handleOpenChamberLogFormDirect(chamber)}
                 >
                   {/* Left: Chamber details */}
-                  <View style={{ flex: 1.5, alignItems: 'flex-start' }}>
+                  <View style={{ flex: 1, alignItems: 'flex-start' }}>
                     <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 4 }}>
                       <Ionicons name={details.icon} size={14} color={details.pillColor} style={{ marginRight: 6 }} />
                       <Text style={{ fontSize: 13, fontWeight: 'bold', color: '#1e293b' }}>{chamber.name}</Text>
@@ -1953,20 +3077,12 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
                     </View>
                   </View>
 
-                  {/* Middle: Clients list */}
-                  <View style={{ flex: 2, paddingHorizontal: 12, borderLeftWidth: 1, borderRightWidth: 1, borderColor: '#e2e8f0' }}>
-                    <Text style={{ fontSize: 9, fontWeight: '700', color: '#94a3b8', textTransform: 'uppercase', marginBottom: 2 }}>Clients</Text>
-                    <Text style={{ fontSize: 12, fontWeight: '700', color: '#334155' }} numberOfLines={2}>
-                      {clientNames || 'No Clients'}
-                    </Text>
-                  </View>
-
-                  {/* Right: Status indicator */}
-                  <View style={{ flex: 1, alignItems: 'flex-end', justifyContent: 'center' }}>
+                  {/* Right: Status */}
+                  <View style={{ alignItems: 'flex-end', justifyContent: 'center' }}>
                     <View style={[styles.statusIndicatorRow, { marginTop: 0 }]}>
-                      <View style={[styles.statusDot, { backgroundColor: details.statusColor }]} />
-                      <Text style={[styles.statusText, { color: details.statusColor, fontSize: 11 }]}>
-                        {completedChamberLogs.length === chamberTasks.length ? 'Done' : 'Normal'}
+                      <View style={[styles.statusDot, { backgroundColor: isDone ? '#16a34a' : details.statusColor }]} />
+                      <Text style={[styles.statusText, { color: isDone ? '#16a34a' : details.statusColor, fontSize: 11 }]}>
+                        {isDone ? 'Done' : 'Pending'}
                       </Text>
                     </View>
                   </View>
@@ -1983,12 +3099,14 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
 
   // B. TASKS TAB VIEW
   const renderTasksView = () => {
+    const taskRows = getTasksScreenList(activeTab);
+
     return (
       <View style={styles.tabContainer}>
         {/* Top Filters */}
         <View style={styles.filterTabsRow}>
           {['All', 'Pending', 'Completed', 'Overdue'].map((tab) => {
-            const count = getFilteredAssignments(tab).length;
+            const count = getTasksScreenList(tab).length;
             return (
               <TouchableOpacity
                 key={tab}
@@ -2007,10 +3125,10 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
         <View style={styles.tasksInfoBanner}>
           <Text style={styles.tasksInfoTitle}>{activeTab} tasks</Text>
           <Text style={styles.tasksInfoText}>
-            {activeTab === 'All' && 'Today\'s scheduled inspections across all chambers and shifts.'}
-            {activeTab === 'Pending' && 'Open a task to record temperature, box count, and sensor photo.'}
-            {activeTab === 'Completed' && 'Logged inspections. Edit requires Super Admin permission.'}
-            {activeTab === 'Overdue' && 'Missed audits from the past 2 days — log the missed shift reading.'}
+            {activeTab === 'All' && 'Chamber tasks with total client lots. Stays Pending until every client is logged.'}
+            {activeTab === 'Pending' && 'Select each client lot and submit. Chamber stays here until all clients are done.'}
+            {activeTab === 'Completed' && 'Client-wise completed logs (only after each client submit).'}
+            {activeTab === 'Overdue' && 'Missed chamber audits from the past 2 days.'}
           </Text>
         </View>
 
@@ -2021,27 +3139,30 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
             <RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={["#003580"]} />
           }
         >
-          {getFilteredAssignments().length === 0 ? (
+          {taskRows.length === 0 ? (
             <View style={styles.emptyContainer}>
               <Ionicons name="clipboard-outline" size={44} color="#94a3b8" />
               <Text style={styles.emptyText}>No tasks found in "{activeTab}" filter.</Text>
             </View>
           ) : (
-            getFilteredAssignments().map((item, idx) => {
+            taskRows.map((item, idx) => {
+              const isChamberRow = !!item.is_chamber_task;
               const targetDate = item.due_date || new Date().toISOString().split('T')[0];
               const targetShiftName = item.shift_time === '10:00' ? 'Morning' : 'Evening';
-              const log = item.is_overdue
+
+              const log = isChamberRow || item.is_overdue
                 ? null
                 : completedLogs.find(l =>
-                    l.chamber_id === item.chamber_id &&
+                    Number(l.chamber_id) === Number(item.chamber_id) &&
                     l.client_name === item.client_name &&
                     l.entry_date === targetDate &&
                     (l.shift === targetShiftName ||
-                      // fallback for older rows without shift column
                       (!l.shift && (!item.shift_time || l.inspection_time === item.shift_time)))
                   );
-              // Completed tab only lists finished tasks — always treat as completed there
-              const isCompleted = activeTab === 'Completed' ? true : !!log;
+
+              const isCompleted = activeTab === 'Completed'
+                ? true
+                : (isChamberRow ? !!item.is_completed : !!log);
               const pattern = getChamberTypeAndDefault(item.chamber_id);
               
               let hasWarning = false;
@@ -2056,9 +3177,27 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
                 ? 'Done'
                 : (item.is_overdue ? 'Overdue' : 'Pending');
 
+              const titleText = isChamberRow
+                ? (item.chamber_name || `Chamber ${item.chamber_id}`)
+                : (item.client_name || 'Client');
+
+              const metaText = isChamberRow
+                ? [
+                    item.shift_label || (item.shift_time === '10:00' ? 'Morning' : 'Evening'),
+                    item.is_overdue && item.due_date ? `Due ${item.due_date}` : null
+                  ].filter(Boolean).join('  ·  ')
+                : [
+                    item.chamber_name,
+                    item.shift_label || (item.shift_time === '10:00' ? 'Morning' : 'Evening')
+                  ].filter(Boolean).join('  ·  ');
+
               return (
                 <View
-                  key={`${item.chamber_id}_${item.client_name}_${item.shift_time || 'na'}_${idx}`}
+                  key={
+                    isChamberRow
+                      ? `ch_${item.chamber_id}_${item.shift_time || 'na'}_${item.due_date || 'today'}_${idx}`
+                      : `${item.chamber_id}_${item.client_name}_${item.shift_time || 'na'}_${idx}`
+                  }
                   style={[
                     styles.taskItemCard,
                     isCompleted && styles.taskItemCardCompleted,
@@ -2076,12 +3215,21 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
                     ]}
                   />
 
-                  <View style={styles.taskCardBody}>
+                  <View style={[styles.taskCardBody, isChamberRow && { alignItems: 'flex-start' }]}>
                     <TouchableOpacity
                       style={styles.taskCardMain}
                       activeOpacity={0.7}
                       onPress={() => {
-                        if (isCompleted) {
+                        if (isChamberRow) {
+                          const chamber =
+                            chambersList.find((c) => Number(c.id) === Number(item.chamber_id)) || {
+                              id: item.chamber_id,
+                              name: item.chamber_name
+                            };
+                          if (item.shift_time === '16:00') handleSelectShift('Evening');
+                          else handleSelectShift('Morning');
+                          handleOpenChamberLogFormDirect(chamber);
+                        } else if (isCompleted) {
                           handleOpenTaskDetail(item);
                         } else {
                           handleOpenTaskLogForm(item);
@@ -2089,23 +3237,26 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
                       }}
                     >
                       <Text style={styles.taskClientName} numberOfLines={1}>
-                        {item.client_name}
+                        {titleText}
                       </Text>
 
                       <Text style={styles.taskMetaLine} numberOfLines={1}>
-                        {item.chamber_name}
-                        {item.shift_label || item.shift_time
-                          ? `  ·  ${item.shift_label || (item.shift_time === '10:00' ? 'Morning' : 'Evening')}`
-                          : ''}
+                        {metaText}
                       </Text>
 
-                      {item.is_overdue ? (
+                      {isChamberRow && item.target_set ? (
+                        <Text style={{ fontSize: 11, fontWeight: '600', color: '#64748b', marginTop: 4 }}>
+                          Logged {Number(item.clients_done) || 0}/{Number(item.clients_total) || 0} clients
+                        </Text>
+                      ) : null}
+
+                      {item.is_overdue && !isChamberRow ? (
                         <Text style={styles.taskOverdueDateText}>
                           Due {item.due_date}
                         </Text>
                       ) : null}
 
-                      {isCompleted && log ? (
+                      {isCompleted && log && !isChamberRow ? (
                         <View style={styles.taskReadingRow}>
                           <Text style={[styles.readingLoggedText, hasWarning && { color: '#64748b' }]}>
                             {log.box_temp}°C
@@ -2133,7 +3284,20 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
                       {!isCompleted ? (
                         <TouchableOpacity
                           style={styles.logActionBtn}
-                          onPress={() => handleOpenTaskLogForm(item)}
+                          onPress={() => {
+                            if (isChamberRow) {
+                              const chamber =
+                                chambersList.find((c) => Number(c.id) === Number(item.chamber_id)) || {
+                                  id: item.chamber_id,
+                                  name: item.chamber_name
+                                };
+                              if (item.shift_time === '16:00') handleSelectShift('Evening');
+                              else handleSelectShift('Morning');
+                              handleOpenChamberLogFormDirect(chamber);
+                            } else {
+                              handleOpenTaskLogForm(item);
+                            }
+                          }}
                           activeOpacity={0.85}
                         >
                           <Ionicons name="thermometer-outline" size={14} color="#ffffff" style={{ marginRight: 4 }} />
@@ -2142,11 +3306,22 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
                       ) : (
                         <TouchableOpacity
                           style={styles.logActionBtn}
-                          onPress={() => handleEditCompletedLog(item)}
+                          onPress={() => {
+                            if (isChamberRow) {
+                              const chamber =
+                                chambersList.find((c) => Number(c.id) === Number(item.chamber_id)) || {
+                                  id: item.chamber_id,
+                                  name: item.chamber_name
+                                };
+                              handleOpenChamberLogFormDirect(chamber);
+                            } else {
+                              handleEditCompletedLog(item);
+                            }
+                          }}
                           activeOpacity={0.85}
                         >
                           <Ionicons name="create-outline" size={14} color="#ffffff" style={{ marginRight: 4 }} />
-                          <Text style={styles.logActionBtnText}>Edit</Text>
+                          <Text style={styles.logActionBtnText}>{isChamberRow ? 'Open' : 'Edit'}</Text>
                         </TouchableOpacity>
                       )}
                     </View>
@@ -2194,6 +3369,13 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
         if (reportShiftFilter !== 'all') {
           const resolved = normalizeShiftLabel(log.shift || log.inspection_time);
           if (resolved !== reportShiftFilter) return false;
+        }
+        // Calendar date range (From → To)
+        const entryDay = String(log.entry_date || '').slice(0, 10);
+        if (entryDay) {
+          const from = reportDateFrom <= reportDateTo ? reportDateFrom : reportDateTo;
+          const to = reportDateFrom <= reportDateTo ? reportDateTo : reportDateFrom;
+          if (entryDay < from || entryDay > to) return false;
         }
         if (reportSearchQuery.trim()) {
           const q = reportSearchQuery.toLowerCase().trim();
@@ -2598,32 +3780,88 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
                     onPress={() => openPermissionNotificationTask(notif)}
                   >
                     <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
-                      <Text style={{ fontSize: 9.5, fontWeight: '800', color: '#64748b' }}>
-                        Edit Permission · {formattedDate}
-                      </Text>
+                    <Text style={{ fontSize: 9.5, fontWeight: '800', color: '#64748b' }}>
+                      {notif.record_type === 'MasterSetup'
+                        ? 'Master Setup'
+                        : notif.record_type === 'ChamberMaster'
+                          ? (/ADD chamber/i.test(String(notif.description || ''))
+                            ? 'Chamber Add'
+                            : 'Chamber Delete')
+                          : notif.record_type === 'ClientMaster'
+                            ? (/EDIT client|UPDATE_CLIENT|edited client/i.test(String(notif.description || notif.action || ''))
+                              ? 'Client Edit (Notify)'
+                              : 'Client Delete (Notify)')
+                            : 'Edit Permission'}{' '}
+                      · {formattedDate}
+                    </Text>
                       <View style={{
-                        backgroundColor: isApproved ? '#f0fdf4' : '#fef2f2',
+                        backgroundColor:
+                          notif.record_type === 'ClientMaster' || notif.record_type === 'MasterSetup'
+                            ? '#eff6ff'
+                            : (isApproved ? '#f0fdf4' : '#fef2f2'),
                         paddingHorizontal: 6,
                         paddingVertical: 2,
                         borderRadius: 4
                       }}>
-                        <Text style={{ fontSize: 9, fontWeight: '800', color: isApproved ? '#16a34a' : '#ef4444' }}>
-                          {isApproved ? 'APPROVED' : 'DENIED'}
+                        <Text style={{
+                          fontSize: 9,
+                          fontWeight: '800',
+                          color:
+                            notif.record_type === 'ClientMaster'
+                              ? '#1d4ed8'
+                              : notif.record_type === 'MasterSetup'
+                                ? '#0369a1'
+                                : (isApproved ? '#16a34a' : '#ef4444')
+                        }}>
+                          {notif.record_type === 'ClientMaster'
+                            ? 'NOTIFY'
+                            : notif.record_type === 'MasterSetup'
+                              ? 'OPEN'
+                              : (isApproved ? 'APPROVED' : 'DENIED')}
                         </Text>
                       </View>
                     </View>
 
                     <Text style={{ fontSize: 12, fontWeight: '700', color: '#1e293b', lineHeight: 16, marginBottom: 2 }}>
-                      {meta.chamber_name} · {meta.client_name}
+                      {notif.record_type === 'MasterSetup'
+                        ? 'Chambers & Clients management'
+                        : notif.record_type === 'ChamberMaster'
+                          ? (
+                            String(notif.description || '').match(/ADD chamber "([^"]+)"/i)?.[1] ||
+                            String(notif.description || '').match(/delete chamber "([^"]+)"/i)?.[1] ||
+                            `Chamber #${notif.record_id}`
+                          )
+                          : notif.record_type === 'ClientMaster'
+                            ? (
+                              String(notif.description || '').match(/EDIT client "([^"]+)"/i)?.[1] ||
+                              String(notif.description || '').match(/DELETE client "([^"]+)"/i)?.[1] ||
+                              'Client master'
+                            )
+                          : `${meta.chamber_name} · ${meta.client_name}`}
                     </Text>
                     <Text style={{ fontSize: 11, fontWeight: '600', color: '#475569', marginBottom: 6 }}>
-                      {shiftLabel} task · Edit {isApproved ? 'approved' : 'denied'}
-                      {meta.reference_no ? ` · ${meta.reference_no}` : ''}
+                      {notif.record_type === 'MasterSetup'
+                        ? 'Master Setup (no allow needed)'
+                        : notif.record_type === 'ChamberMaster'
+                          ? `${/ADD chamber/i.test(String(notif.description || '')) ? 'Chamber add' : 'Chamber delete'} ${isApproved ? 'approved' : 'denied'}`
+                          : notif.record_type === 'ClientMaster'
+                            ? 'Already saved · Super Admin notified only'
+                          : `${shiftLabel} task · Edit ${isApproved ? 'approved' : 'denied'}${meta.reference_no ? ` · ${meta.reference_no}` : ''}`}
                     </Text>
 
                     <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
                       <Text style={{ fontSize: 9.5, color: isApproved ? '#16a34a' : '#ef4444', fontWeight: '800' }}>
-                        {isApproved ? 'Open task to edit ➔' : 'View & dismiss ➔'}
+                        {notif.record_type === 'ChamberMaster' && isApproved
+                          ? (/ADD chamber/i.test(String(notif.description || ''))
+                            ? 'Tap to assign chamber ➔'
+                            : 'Tap to delete chamber ➔')
+                          : notif.record_type === 'ClientMaster'
+                            ? 'Tap to dismiss ➔'
+                          : notif.record_type === 'MasterSetup'
+                            ? 'Tap to open Master Setup ➔'
+                          : isApproved
+                            ? 'Open task to edit ➔'
+                            : 'View & dismiss ➔'}
                       </Text>
                       <View style={{
                         width: 6,
@@ -2843,22 +4081,34 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
 
   // C. REPORTS TAB VIEW
   const renderReportsView = () => {
-    // DO profile access scope = active chamber/client assignments for this operator
-    const accessAssignments = assignments.filter((a) => a && a.status !== 'inactive');
-    const accessChamberIds = new Set(accessAssignments.map((a) => Number(a.chamber_id)));
-    const accessChambers = chambersList.filter((c) => accessChamberIds.has(Number(c.id)));
+    // Chamber list for this DO (Master Setup / assigned chambers)
+    const accessChambers = (chambersList || []).length
+      ? chambersList
+      : assignments
+          .filter((a) => a && a.status !== 'inactive')
+          .reduce((acc, a) => {
+            if (!acc.some((c) => Number(c.id) === Number(a.chamber_id))) {
+              acc.push({ id: a.chamber_id, name: a.chamber_name });
+            }
+            return acc;
+          }, []);
 
-    const clientsForFilter = accessAssignments
-      .filter((a) =>
-        reportChamberFilter === 'all'
-          ? true
-          : Number(a.chamber_id) === Number(reportChamberFilter)
-      )
-      .map((a) => a.client_name)
-      .filter(Boolean);
-    const accessClients = Array.from(new Set(clientsForFilter)).sort((a, b) =>
-      String(a).localeCompare(String(b))
-    );
+    // Client filter = that chamber's client master (or all masters if All Chambers)
+    const accessClients =
+      reportChamberFilter === 'all'
+        ? Array.from(
+            new Set(
+              accessChambers.flatMap((ch) =>
+                getClientsForChamber(ch.id).map((a) => String(a.client_name || '').trim())
+              )
+            )
+          )
+            .filter(Boolean)
+            .sort((a, b) => String(a).localeCompare(String(b)))
+        : getClientsForChamber(reportChamberFilter)
+            .map((a) => String(a.client_name || '').trim())
+            .filter(Boolean)
+            .sort((a, b) => String(a).localeCompare(String(b)));
 
     const selectedChamberLabel =
       reportChamberFilter === 'all'
@@ -2879,7 +4129,8 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
       setOpen,
       options,
       onSelect,
-      closeOther
+      closeOther,
+      emptyText
     }) => (
       <View style={{ flex: 1, position: 'relative', zIndex: open ? 30 : 1 }}>
         <Text style={styles.reportFilterLabel}>{label}</Text>
@@ -2901,31 +4152,37 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
           />
         </TouchableOpacity>
         {open && (
-          <View style={styles.reportFilterDropdown}>
+          <View style={styles.reportFilterDropdownInline}>
             <ScrollView nestedScrollEnabled keyboardShouldPersistTaps="handled" style={{ maxHeight: 180 }}>
-              {options.map((opt) => (
-                <TouchableOpacity
-                  key={String(opt.value)}
-                  style={styles.reportFilterOption}
-                  onPress={() => {
-                    onSelect(opt.value);
-                    setOpen(false);
-                  }}
-                >
-                  <Text
-                    style={[
-                      styles.reportFilterOptionText,
-                      opt.value === (label === 'Chamber' ? reportChamberFilter : reportClientFilter) && {
-                        color: '#003580',
-                        fontWeight: '700'
-                      }
-                    ]}
-                    numberOfLines={1}
+              {options.length === 0 ? (
+                <Text style={{ padding: 12, fontSize: 12, color: '#94a3b8' }}>
+                  {emptyText || 'No options'}
+                </Text>
+              ) : (
+                options.map((opt) => (
+                  <TouchableOpacity
+                    key={String(opt.value)}
+                    style={styles.reportFilterOption}
+                    onPress={() => {
+                      onSelect(opt.value);
+                      setOpen(false);
+                    }}
                   >
-                    {opt.label}
-                  </Text>
-                </TouchableOpacity>
-              ))}
+                    <Text
+                      style={[
+                        styles.reportFilterOptionText,
+                        opt.value === (label.startsWith('Chamber') ? reportChamberFilter : reportClientFilter) && {
+                          color: '#003580',
+                          fontWeight: '700'
+                        }
+                      ]}
+                      numberOfLines={1}
+                    >
+                      {opt.label}
+                    </Text>
+                  </TouchableOpacity>
+                ))
+              )}
             </ScrollView>
           </View>
         )}
@@ -2947,14 +4204,52 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
           <Text style={styles.reportScopeTitle}>DO Reports</Text>
           <Text style={styles.reportScopeSub} numberOfLines={2}>
             {displayName} · {accessChambers.length} chamber
-            {accessChambers.length === 1 ? '' : 's'} · {Array.from(new Set(accessAssignments.map((a) => a.client_name))).length} client
-            {Array.from(new Set(accessAssignments.map((a) => a.client_name))).length === 1 ? '' : 's'} in access
+            {accessChambers.length === 1 ? '' : 's'} in access
           </Text>
         </View>
 
-        {/* Chamber + Client filters (DO access only) */}
-        <Text style={[styles.reportSectionLabel, { marginTop: 4 }]}>Filters</Text>
-        <View style={styles.reportFiltersRow}>
+        {/* Calendar / date range filter */}
+        <Text style={[styles.reportSectionLabel, { marginTop: 4 }]}>Date</Text>
+        {renderDateSlider()}
+        <View style={styles.reportDateRangeRow}>
+          <TouchableOpacity
+            style={styles.reportDateRangeBtn}
+            activeOpacity={0.85}
+            onPress={() => {
+              setCalendarMonth(new Date(reportDateFrom));
+              setCalendarPickMode('from');
+              setShowCalendarModal(true);
+            }}
+          >
+            <Ionicons name="calendar-outline" size={16} color="#003580" />
+            <Text style={styles.reportDateRangeBtnText}>
+              {reportDateFrom === reportDateTo
+                ? reportDateFrom
+                : `${reportDateFrom} → ${reportDateTo}`}
+            </Text>
+            <Ionicons name="chevron-down" size={14} color="#64748b" />
+          </TouchableOpacity>
+          {!(
+            reportDateFrom === new Date().toISOString().split('T')[0] &&
+            reportDateTo === reportDateFrom
+          ) && (
+            <TouchableOpacity
+              style={styles.reportDateTodayBtn}
+              onPress={() => {
+                const today = new Date().toISOString().split('T')[0];
+                setSelectedReportDate(today);
+                setReportDateFrom(today);
+                setReportDateTo(today);
+              }}
+            >
+              <Text style={styles.reportDateTodayBtnText}>Today</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+
+        {/* Chamber + Client filters (DO access only) — Client below Chamber */}
+        <Text style={[styles.reportSectionLabel, { marginTop: 10 }]}>Filters</Text>
+        <View style={{ marginBottom: 4 }}>
           {renderFilterDropdown({
             label: 'Chamber',
             valueLabel: selectedChamberLabel,
@@ -2967,26 +4262,25 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
             ],
             onSelect: (val) => {
               setReportChamberFilter(val);
-              // Reset client if it is not under newly selected chamber
-              if (val !== 'all') {
-                const stillValid = accessAssignments.some(
-                  (a) =>
-                    Number(a.chamber_id) === Number(val) &&
-                    String(a.client_name) === String(reportClientFilter)
-                );
-                if (reportClientFilter !== 'all' && !stillValid) {
-                  setReportClientFilter('all');
-                }
-              }
+              // Reset client when chamber changes — client master is chamber-wise
+              setReportClientFilter('all');
             }
           })}
-          <View style={{ width: 10 }} />
+        </View>
+        <View style={{ marginBottom: 12, marginTop: 8 }}>
           {renderFilterDropdown({
-            label: 'Client',
+            label:
+              reportChamberFilter === 'all'
+                ? 'Client Master'
+                : `Client Master (${selectedChamberLabel})`,
             valueLabel: selectedClientLabel,
             open: showReportClientDropdown,
             setOpen: setShowReportClientDropdown,
             closeOther: () => setShowReportChamberDropdown(false),
+            emptyText:
+              reportChamberFilter === 'all'
+                ? 'No client masters on chambers yet.'
+                : 'No client master on this chamber. Add in Master Setup.',
             options: [
               { value: 'all', label: 'All Clients' },
               ...accessClients.map((name) => ({ value: name, label: name }))
@@ -3067,7 +4361,7 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
             <View style={styles.reportsEmptyRow}>
               <Ionicons name="clipboard-outline" size={24} color="#94a3b8" />
               <Text style={[styles.reportsEmptyText, { color: '#64748b', fontWeight: '500' }]}>
-                No logs for this chamber / client / slot filter.
+                No logs for this date / chamber / client / slot filter.
               </Text>
             </View>
           ) : (
@@ -3164,17 +4458,14 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
         </View>
 
         <View style={styles.moreSectionCard}>
-          <Text style={styles.moreSectionTitle}>Client Master Setup</Text>
-          <Text style={styles.ipSettingsDesc}>Manage client assignments (add or remove lots) dynamically for each chamber:</Text>
+          <Text style={styles.moreSectionTitle}>Master Setup</Text>
+          <Text style={styles.ipSettingsDesc}>Add chambers and manage client names for each chamber separately.</Text>
           <TouchableOpacity 
             style={[styles.ipUpdateActionBtn, { backgroundColor: '#f0fdf4', borderColor: '#bbf7d0', borderWidth: 1 }]}
-            onPress={() => {
-              setManagerSelectedChamber(null);
-              setShowClientManagerModal(true);
-            }}
+            onPress={openMasterManager}
           >
-            <Ionicons name="people" size={16} color="#15803d" style={{ marginRight: 6 }} />
-            <Text style={[styles.ipUpdateActionBtnText, { color: '#15803d' }]}>Manage Dynamic Client Lots</Text>
+            <Ionicons name="cube-outline" size={16} color="#15803d" style={{ marginRight: 6 }} />
+            <Text style={[styles.ipUpdateActionBtnText, { color: '#15803d' }]}>Open Master Setup</Text>
           </TouchableOpacity>
         </View>
 
@@ -3244,7 +4535,12 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
               </TouchableOpacity>
             </View>
 
-            <ScrollView contentContainerStyle={{ paddingVertical: 10 }} showsVerticalScrollIndicator={false}>
+            <ScrollView
+              contentContainerStyle={{ paddingVertical: 10, paddingBottom: 40 }}
+              showsVerticalScrollIndicator={false}
+              keyboardShouldPersistTaps="handled"
+              nestedScrollEnabled
+            >
               
               {/* Dynamic Chamber Classification Header Card */}
               {selectedChamber && (
@@ -3293,13 +4589,16 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
               {/* Vertical Stack Form Design */}
               <View style={{ paddingHorizontal: 4 }}>
                 
-                {/* Chamber Dropdown Selector (if global FAB '+' click) */}
-                {openedFromFab && isProfileEditable && !selectedChamber && (
-                  <View style={{ marginBottom: 12, position: 'relative', zIndex: 2000 }}>
+                {/* Chamber Dropdown Selector (FAB '+') — inline list (not absolute) so Android does not clip */}
+                {openedFromFab && isProfileEditable && (
+                  <View style={{ marginBottom: 12, zIndex: 20 }}>
                     <Text style={styles.modalLabel}>Select Chamber</Text>
                     <TouchableOpacity 
                       style={styles.dropdownTrigger} 
-                      onPress={() => setShowChamberDropdown(!showChamberDropdown)}
+                      onPress={() => {
+                        setShowClientDropdown(false);
+                        setShowChamberDropdown(!showChamberDropdown);
+                      }}
                       activeOpacity={0.8}
                     >
                       <Text style={[styles.dropdownTriggerText, !selectedChamber && { color: '#94a3b8' }]}>
@@ -3309,28 +4608,36 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
                     </TouchableOpacity>
 
                     {showChamberDropdown && (
-                      <View style={styles.dropdownList}>
-                        <ScrollView style={{ maxHeight: 180 }} nestedScrollEnabled showsVerticalScrollIndicator={true}>
-                          {chambersList.map(ch => (
+                      <View style={styles.dropdownListInline}>
+                        {chambersList.length === 0 ? (
+                          <Text style={{ padding: 12, fontSize: 12, color: '#94a3b8' }}>
+                            No chambers available (limit: {chamberLimit}). Create chambers / assignments first.
+                          </Text>
+                        ) : (
+                          chambersList.map(ch => (
                             <TouchableOpacity 
                               key={ch.id} 
-                              style={styles.dropdownItem} 
+                              style={[
+                                styles.dropdownItem,
+                                selectedChamber?.id === ch.id && { backgroundColor: '#eff6ff' }
+                              ]} 
                               onPress={() => {
                                 setSelectedChamber(ch);
                                 setShowChamberDropdown(false);
                                 setSelectedClient(null);
                                 setSelectedChamberType(getChamberTypeAndDefault(ch.id).type);
+                                const t = getChamberClientTarget(ch.id);
+                                setTotalClientsDraft(t != null ? String(t) : '');
                               }}
                             >
                               <Text style={styles.dropdownItemText}>{ch.name}</Text>
                             </TouchableOpacity>
-                          ))}
-                        </ScrollView>
+                          ))
+                        )}
                       </View>
                     )}
                   </View>
                 )}
-
                 {/* Chamber Type Selector (Dynamic tabs control) */}
                 <View style={{ marginBottom: 12 }}>
                   <Text style={styles.modalLabel}>Chamber Type (Select compliance standard)</Text>
@@ -3425,53 +4732,115 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
                   </View>
                 )}
 
-                {/* Client Lot Selector */}
-                <View style={{ marginBottom: 12, position: 'relative', zIndex: 1000 }}>
-                  <Text style={styles.modalLabel}>Client Lot Name</Text>
+                {/* Total Clients — above Client Lot Name, same input as Box Qty */}
+                <View style={{ marginBottom: 12 }}>
+                  <Text style={styles.modalLabel}>Total Clients</Text>
                   {isProfileEditable ? (
                     <>
-                      <TouchableOpacity 
-                        style={[styles.dropdownTrigger, !selectedChamber && styles.dropdownDisabled, { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 10 }]} 
-                        disabled={!selectedChamber}
-                        onPress={() => setShowClientDropdown(!showClientDropdown)}
-                        activeOpacity={0.8}
-                      >
-                        <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1 }}>
-                          <View style={{ width: 22, height: 22, borderRadius: 11, backgroundColor: '#f1f5f9', alignItems: 'center', justifyContent: 'center', marginRight: 8 }}>
-                            <Ionicons name="briefcase-outline" size={12} color="#475569" />
-                          </View>
-                          <Text style={[styles.dropdownTriggerText, !selectedClient && { color: '#94a3b8' }, { fontSize: 13, fontWeight: '700' }]}>
-                            {selectedClient || (selectedChamber ? 'Select Client Lot...' : 'Select Chamber first')}
-                          </Text>
-                          {selectedChamber && selectedClient && isClientCompletedToday(selectedChamber.id, selectedClient, selectedShift) && (
-                            <View style={[styles.completedBadgePill, { flexDirection: 'row', alignItems: 'center', marginLeft: 8, paddingVertical: 1, paddingHorizontal: 6, backgroundColor: '#e2f0d9' }]}>
-                              <Ionicons name="checkmark-circle" size={10} color="#385723" style={{ marginRight: 2 }} />
-                              <Text style={[styles.completedBadgeText, { color: '#385723', fontSize: 8 }]}>Submitted</Text>
-                            </View>
-                          )}
-                        </View>
-                        <Ionicons name={showClientDropdown ? 'chevron-up' : 'chevron-down'} size={16} color="#64748b" />
-                      </TouchableOpacity>
+                      <View style={styles.inputWrapper}>
+                        <Ionicons name="people-outline" size={16} color="#64748b" style={styles.inputIcon} />
+                        <TextInput
+                          style={styles.input}
+                          placeholder="e.g. 3"
+                          placeholderTextColor="#94a3b8"
+                          keyboardType="numeric"
+                          maxLength={2}
+                          value={totalClientsDraft}
+                          onChangeText={(text) => {
+                            const cleaned = String(text || '').replace(/[^\d]/g, '');
+                            setTotalClientsDraft(cleaned);
+                            if (selectedChamber) {
+                              saveChamberClientTarget(selectedChamber.id, cleaned);
+                            }
+                          }}
+                          editable={!!selectedChamber}
+                        />
+                      </View>
+                      <Text style={{ fontSize: 9, color: '#475569', marginTop: 4, marginLeft: 2, fontWeight: '600' }}>
+                        Type 1, 2, 3 or 4 — chamber completes after this many client submits
+                        {selectedChamber && getChamberClientTarget(selectedChamber.id) != null
+                          ? ` (${countLoggedClientsForChamber(
+                              selectedChamber.id,
+                              selectedShift === '16:00' ? 'Evening' : 'Morning',
+                              new Date().toISOString().split('T')[0]
+                            )}/${getChamberClientTarget(selectedChamber.id)} done)`
+                          : ''}
+                      </Text>
+                    </>
+                  ) : (
+                    <View style={styles.readOnlyField}>
+                      <Text style={styles.readOnlyText}>{totalClientsDraft || '0'} clients</Text>
+                    </View>
+                  )}
+                </View>
 
-                      {showClientDropdown && selectedChamber && (
-                        <View style={[styles.dropdownList, { marginTop: 4, borderRadius: 10, borderWidth: 1.2, borderColor: '#cbd5e1', elevation: 3, shadowOpacity: 0.08 }]}>
-                          <ScrollView style={{ maxHeight: 180 }} keyboardShouldPersistTaps="handled" nestedScrollEnabled showsVerticalScrollIndicator={true}>
-                            {assignments
-                              .filter(item => item.chamber_id === selectedChamber.id && item.status !== 'inactive')
-                              .map(item => {
+                {/* Client Lot Name */}
+                <View style={{ marginBottom: 12, zIndex: 10 }}>
+                    <Text style={styles.modalLabel}>Client Lot Name</Text>
+                    {isProfileEditable ? (
+                      <>
+                        <TouchableOpacity 
+                          style={[styles.dropdownTrigger, !selectedChamber && styles.dropdownDisabled, { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 10 }]} 
+                          disabled={!selectedChamber}
+                          onPress={() => {
+                            if (!selectedChamber) return;
+                            setShowChamberDropdown(false);
+                            setShowClientDropdown(!showClientDropdown);
+                          }}
+                          activeOpacity={0.8}
+                        >
+                          <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1 }}>
+                            <View style={{ width: 22, height: 22, borderRadius: 11, backgroundColor: '#f1f5f9', alignItems: 'center', justifyContent: 'center', marginRight: 8 }}>
+                              <Ionicons name="briefcase-outline" size={12} color="#475569" />
+                            </View>
+                            <Text style={[styles.dropdownTriggerText, !selectedClient && { color: '#94a3b8' }, { fontSize: 13, fontWeight: '700' }]} numberOfLines={1}>
+                              {selectedClient || (selectedChamber ? 'Select Client Lot...' : 'Select Chamber first')}
+                            </Text>
+                            {selectedChamber && selectedClient && isClientCompletedToday(selectedChamber.id, selectedClient, selectedShift) && (
+                              <View style={[styles.completedBadgePill, { flexDirection: 'row', alignItems: 'center', marginLeft: 8, paddingVertical: 1, paddingHorizontal: 6, backgroundColor: '#e2f0d9' }]}>
+                                <Ionicons name="checkmark-circle" size={10} color="#385723" style={{ marginRight: 2 }} />
+                                <Text style={[styles.completedBadgeText, { color: '#385723', fontSize: 8 }]}>Submitted</Text>
+                              </View>
+                            )}
+                          </View>
+                          <Ionicons name={showClientDropdown ? 'chevron-up' : 'chevron-down'} size={16} color="#64748b" />
+                        </TouchableOpacity>
+
+                        {showClientDropdown && selectedChamber && (
+                          <View style={[styles.dropdownListInline, { maxHeight: 220 }]}>
+                            <ScrollView
+                              nestedScrollEnabled
+                              keyboardShouldPersistTaps="handled"
+                              showsVerticalScrollIndicator
+                              style={{ maxHeight: 220 }}
+                            >
+                            {(() => {
+                              const ordered = getClientsForChamber(selectedChamber.id);
+
+                              if (ordered.length === 0) {
+                                return (
+                                  <Text style={{ padding: 12, fontSize: 12, color: '#94a3b8' }}>
+                                    No clients on this chamber yet. Use Plus → Manage Chambers to add client names for this chamber only.
+                                  </Text>
+                                );
+                              }
+
+                              return ordered.map((item) => {
                                 const isSelected = selectedClient === item.client_name;
-                                const isCompleted = isClientCompletedToday(selectedChamber.id, item.client_name, selectedShift);
+                                const isCompleted = isClientCompletedToday(
+                                  selectedChamber.id,
+                                  item.client_name,
+                                  selectedShift
+                                );
                                 const isLockedCompleted = isCompleted && !editingExistingLog;
                                 return (
-                                  <View 
+                                  <View
                                     key={item.client_name}
                                     style={{
                                       flexDirection: 'row',
                                       alignItems: 'center',
                                       borderBottomWidth: 1,
                                       borderBottomColor: '#f1f5f9',
-                                      paddingHorizontal: 10,
-                                      paddingVertical: 6,
                                       backgroundColor: isLockedCompleted
                                         ? '#f0fdf4'
                                         : isSelected
@@ -3480,8 +4849,14 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
                                       opacity: isLockedCompleted ? 0.85 : 1
                                     }}
                                   >
-                                    <TouchableOpacity 
-                                      style={{ flexDirection: 'row', alignItems: 'center', flex: 1 }}
+                                    <TouchableOpacity
+                                      style={{
+                                        flex: 1,
+                                        flexDirection: 'row',
+                                        alignItems: 'center',
+                                        paddingHorizontal: 10,
+                                        paddingVertical: 10
+                                      }}
                                       activeOpacity={isLockedCompleted ? 1 : 0.7}
                                       disabled={isLockedCompleted}
                                       onPress={() => {
@@ -3490,104 +4865,87 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
                                         setShowClientDropdown(false);
                                       }}
                                     >
-                                      <View style={{
-                                        width: 24,
-                                        height: 24,
-                                        borderRadius: 12,
-                                        backgroundColor: isCompleted ? '#dcfce7' : '#f1f5f9',
-                                        alignItems: 'center',
-                                        justifyContent: 'center',
-                                        marginRight: 8
-                                      }}>
-                                        <Ionicons 
-                                          name={isCompleted ? "checkmark-circle" : "folder-open-outline"} 
-                                          size={16} 
-                                          color={isCompleted ? "#16a34a" : "#64748b"} 
-                                        />
-                                      </View>
                                       <Text
-                                        style={{
-                                          fontSize: 13,
-                                          fontWeight: '700',
-                                          color: isLockedCompleted
-                                            ? '#15803d'
-                                            : isSelected
-                                              ? '#003580'
-                                              : '#334155',
-                                          flex: 1
-                                        }}
+                                        style={[
+                                          styles.dropdownItemText,
+                                          { flex: 1 },
+                                          isLockedCompleted && styles.dropdownItemTextDisabled
+                                        ]}
                                         numberOfLines={1}
                                       >
                                         {item.client_name}
+                                        {isLockedCompleted ? ' (submitted)' : ''}
                                       </Text>
-                                      {isCompleted && (
-                                        <View style={{ flexDirection: 'row', alignItems: 'center', marginRight: 6, paddingVertical: 2, paddingHorizontal: 6, borderRadius: 10, backgroundColor: '#dcfce7' }}>
-                                          <Ionicons name="checkmark" size={11} color="#16a34a" style={{ marginRight: 2 }} />
-                                          <Text style={{ fontSize: 8, color: '#15803d', fontWeight: 'bold' }}>Done</Text>
-                                        </View>
-                                      )}
+                                      {isLockedCompleted ? (
+                                        <Ionicons
+                                          name="checkmark-circle"
+                                          size={16}
+                                          color="#16a34a"
+                                          style={{ marginLeft: 6 }}
+                                        />
+                                      ) : isSelected ? (
+                                        <Ionicons
+                                          name="checkmark"
+                                          size={16}
+                                          color="#003580"
+                                          style={{ marginLeft: 6 }}
+                                        />
+                                      ) : null}
                                     </TouchableOpacity>
-                                    
-                                    {/* Delete Client button in dropdown — hide when already submitted */}
-                                    {!isLockedCompleted && (
-                                      <TouchableOpacity
-                                        style={{
-                                          padding: 6,
-                                          borderRadius: 6,
-                                          backgroundColor: '#fef2f2',
-                                          marginLeft: 6
-                                        }}
-                                        activeOpacity={0.7}
-                                        onPress={() => {
-                                          setClientToDelete({
-                                            chamberId: selectedChamber.id,
-                                            clientName: item.client_name,
-                                            chamberName: selectedChamber.name
-                                          });
-                                          setDeleteRemarkInput('');
-                                          setShowDeleteConfirmModal(true);
-                                        }}
-                                      >
-                                        <Ionicons name="trash-outline" size={12} color="#ef4444" />
-                                      </TouchableOpacity>
-                                    )}
+                                    <TouchableOpacity
+                                      hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                                      style={{
+                                        paddingHorizontal: 12,
+                                        paddingVertical: 10,
+                                        justifyContent: 'center',
+                                        alignItems: 'center'
+                                      }}
+                                      onPress={() => openDeleteClientFromTaskForm(item.client_name)}
+                                      accessibilityLabel={`Delete ${item.client_name}`}
+                                    >
+                                      <Ionicons name="trash-outline" size={16} color="#dc2626" />
+                                    </TouchableOpacity>
                                   </View>
                                 );
-                              })}
+                              });
+                            })()}
+                            </ScrollView>
+                          </View>
+                        )}
 
-                            {/* Add client button at the bottom of the list */}
-                            <TouchableOpacity 
-                              style={{
-                                flexDirection: 'row',
-                                alignItems: 'center',
-                                justifyContent: 'center',
-                                paddingVertical: 8,
-                                backgroundColor: '#f8fafc',
-                                borderTopWidth: 1,
-                                borderColor: '#e2e8f0',
-                                borderStyle: 'dashed'
-                              }}
-                              activeOpacity={0.8}
-                              onPress={() => {
-                                setInlineClientInput('');
-                                setInlineRemarkInput('');
-                                setShowAddClientModal(true);
-                              }}
-                            >
-                              <Ionicons name="add-circle" size={14} color="#64748b" style={{ marginRight: 4 }} />
-                              <Text style={{ fontSize: 12, fontWeight: 'bold', color: '#64748b' }}>
-                                Add New Client Lot
-                              </Text>
-                            </TouchableOpacity>
-                          </ScrollView>
-                        </View>
-                      )}
-                    </>
-                  ) : (
-                    <View style={styles.readOnlyField}>
-                      <Text style={styles.readOnlyText} numberOfLines={1}>{selectedClient}</Text>
-                    </View>
-                  )}
+                        {selectedChamber && (
+                          <TouchableOpacity
+                            style={{
+                              flexDirection: 'row',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              paddingVertical: 8,
+                              marginTop: 6,
+                              backgroundColor: '#f8fafc',
+                              borderWidth: 1,
+                              borderColor: '#e2e8f0',
+                              borderRadius: 8,
+                              borderStyle: 'dashed'
+                            }}
+                            activeOpacity={0.8}
+                            onPress={() => {
+                              setInlineClientInput('');
+                              setInlineRemarkInput('');
+                              setShowAddClientModal(true);
+                            }}
+                          >
+                            <Ionicons name="add-circle" size={14} color="#64748b" style={{ marginRight: 4 }} />
+                            <Text style={{ fontSize: 12, fontWeight: 'bold', color: '#64748b' }}>
+                              Add New Client Lot
+                            </Text>
+                          </TouchableOpacity>
+                        )}
+                      </>
+                    ) : (
+                      <View style={styles.readOnlyField}>
+                        <Text style={styles.readOnlyText} numberOfLines={1}>{selectedClient}</Text>
+                      </View>
+                    )}
                 </View>
 
                 {/* Temperature and Box Qty inputs Side-by-Side */}
@@ -3756,143 +5114,372 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
     );
   };
 
-  // 3. CLIENT MASTER MANAGER MODAL (FULL SCREEN)
+  // 3. CLIENT MASTER MANAGER MODAL (FULL SCREEN) — clean chamber / client UX
   const renderClientManagerModal = () => {
+    const chamberClients = managerSelectedChamber
+      ? getClientsForChamber(managerSelectedChamber.id)
+      : [];
+
     return (
       <Modal visible={showClientManagerModal} animationType="slide" transparent={false}>
-        <SafeAreaView style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
-            
-            {/* Modal Header */}
-            <View style={styles.modalHeader}>
-              <View style={{ flex: 1 }}>
-                <Text style={styles.modalTitle}>Manage Client Lots Master</Text>
-                <Text style={styles.modalSubtitle}>Edit active assignments for chambers</Text>
-              </View>
-              <TouchableOpacity onPress={() => setShowClientManagerModal(false)}>
-                <Ionicons name="close-circle-outline" size={26} color="#64748b" />
-              </TouchableOpacity>
-            </View>
-
-            {/* Chamber Selection Dropdown */}
-            <Text style={styles.modalLabel}>Select Chamber Master</Text>
-            <TouchableOpacity 
-              style={styles.dropdownTrigger} 
-              onPress={() => setShowManagerChamberDropdown(!showManagerChamberDropdown)}
-              activeOpacity={0.8}
-            >
-              <Text style={[styles.dropdownTriggerText, !managerSelectedChamber && { color: '#94a3b8' }]}>
-                {managerSelectedChamber?.name || 'Choose a Chamber...'}
+        <SafeAreaView style={styles.mmRoot}>
+          {/* Header */}
+          <View style={styles.mmHeader}>
+            <View style={styles.mmHeaderTextWrap}>
+              <Text style={styles.mmHeaderTitle}>Master Setup</Text>
+              <Text style={styles.mmHeaderSub}>
+                Chambers {chambersList.length}/{chamberLimit}
+                {managerSelectedChamber
+                  ? `  ·  ${managerSelectedChamber.name}: ${chamberClients.length} client${chamberClients.length === 1 ? '' : 's'}`
+                  : ''}
               </Text>
-              <Ionicons name={showManagerChamberDropdown ? 'chevron-up' : 'chevron-down'} size={18} color="#64748b" />
+            </View>
+            <TouchableOpacity
+              style={styles.mmCloseBtn}
+              onPress={() => {
+                setShowClientManagerModal(false);
+                setShowManagerChamberDropdown(false);
+                setShowClientSuggestions(false);
+                setEditingClientName(null);
+              }}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+            >
+              <Ionicons name="close" size={22} color="#475569" />
             </TouchableOpacity>
+          </View>
 
-            {showManagerChamberDropdown && (
-              <View style={styles.dropdownList}>
-                {chambersList.map(ch => (
-                  <TouchableOpacity 
-                    key={ch.id} 
-                    style={styles.dropdownItem} 
-                    onPress={() => {
-                      setManagerSelectedChamber(ch);
-                      setShowManagerChamberDropdown(false);
-                      setNewClientInput('');
-                    }}
-                  >
-                    <Text style={styles.dropdownItemText}>{ch.name}</Text>
-                  </TouchableOpacity>
-                ))}
-              </View>
-            )}
+          {/* Tabs */}
+          <View style={styles.mmTabs}>
+            <TouchableOpacity
+              style={[styles.mmTab, masterManagerTab === 'chambers' && styles.mmTabActive]}
+              onPress={() => setMasterManagerTab('chambers')}
+              activeOpacity={0.85}
+            >
+              <Ionicons
+                name="cube-outline"
+                size={16}
+                color={masterManagerTab === 'chambers' ? '#003580' : '#64748b'}
+              />
+              <Text style={[styles.mmTabText, masterManagerTab === 'chambers' && styles.mmTabTextActive]}>
+                Chambers
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.mmTab, masterManagerTab === 'clients' && styles.mmTabActive]}
+              onPress={() => {
+                setMasterManagerTab('clients');
+                if (!managerSelectedChamber && chambersList[0]) {
+                  setManagerSelectedChamber(chambersList[0]);
+                }
+              }}
+              activeOpacity={0.85}
+            >
+              <Ionicons
+                name="people-outline"
+                size={16}
+                color={masterManagerTab === 'clients' ? '#003580' : '#64748b'}
+              />
+              <Text style={[styles.mmTabText, masterManagerTab === 'clients' && styles.mmTabTextActive]}>
+                Clients
+              </Text>
+            </TouchableOpacity>
+          </View>
 
-            {/* List of Clients currently assigned to the selected Chamber */}
-            {managerSelectedChamber ? (
-              <View style={{ flex: 1, marginTop: 10 }}>
-                <Text style={styles.modalLabel}>
-                  Assigned Client Lots ({assignments.filter(item => item.chamber_id === managerSelectedChamber.id).length})
+          {masterManagerTab === 'chambers' ? (
+            <View style={styles.mmBody}>
+              {/* Add chamber card */}
+              <View style={styles.mmCard}>
+                <Text style={styles.mmCardTitle}>Add chamber</Text>
+                <Text style={styles.mmCardHint}>
+                  Tap below → enter chamber name + remark → Send Request. Super Admin allows in Role & Permission, then chamber assigns automatically.
                 </Text>
-                
-                <ScrollView 
-                  style={{ flex: 1, borderTopWidth: 1, borderColor: '#f1f5f9', marginTop: 5 }}
-                  contentContainerStyle={{ paddingVertical: 10 }}
-                  showsVerticalScrollIndicator={false}
+                <TouchableOpacity
+                  style={[styles.mmPrimaryBtn, { alignSelf: 'stretch', justifyContent: 'center' }]}
+                  onPress={openAddChamberPopup}
+                  activeOpacity={0.85}
                 >
-                  {assignments.filter(item => item.chamber_id === managerSelectedChamber.id).length === 0 ? (
-                    <View style={[styles.emptyContainer, { height: 120, borderStyle: 'dashed', borderWidth: 1.5, borderColor: '#cbd5e1', borderRadius: 8, backgroundColor: '#f8fafc', padding: 15 }]}>
-                      <Ionicons name="people-outline" size={24} color="#94a3b8" />
-                      <Text style={[styles.emptyText, { fontSize: 11 }]}>No client lots assigned to this chamber yet.</Text>
-                    </View>
-                  ) : (
-                    assignments
-                      .filter(item => item.chamber_id === managerSelectedChamber.id)
-                      .map((item) => (
-                        <View 
-                          key={item.client_name}
-                          style={[
-                            styles.taskItemCard, 
-                            { 
-                              paddingVertical: 10, 
-                              paddingHorizontal: 12, 
-                              marginBottom: 8, 
-                              backgroundColor: '#f8fafc',
-                              flexDirection: 'row', 
-                              alignItems: 'center', 
-                              justifyContent: 'space-between'
-                            }
-                          ]}
-                        >
-                          <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1 }}>
-                            <Ionicons name="person" size={16} color="#475569" style={{ marginRight: 8 }} />
-                            <Text style={[styles.taskClientName, { fontSize: 13, flex: 1 }]} numberOfLines={1}>
-                              {item.client_name}
-                            </Text>
-                          </View>
-                          <TouchableOpacity 
-                            style={{ padding: 6 }} 
-                            onPress={() => handleDeleteClient(item.client_name)}
-                          >
-                            <Ionicons name="trash-outline" size={18} color="#ef4444" />
-                          </TouchableOpacity>
-                        </View>
-                      ))
-                  )}
-                </ScrollView>
+                  <Ionicons name="add" size={18} color="#fff" />
+                  <Text style={styles.mmPrimaryBtnText}>Request Add Chamber</Text>
+                </TouchableOpacity>
+              </View>
 
-                {/* Add New Client Box at Bottom */}
-                <View style={{ borderTopWidth: 1, borderColor: '#e2e8f0', paddingTop: 15, paddingBottom: 5 }}>
-                  <Text style={styles.modalLabel}>Add New Client Lot Name</Text>
-                  <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                    <View style={[styles.inputWrapper, { flex: 1, marginBottom: 0, marginRight: 10 }]}>
-                      <Ionicons name="add-circle-outline" size={16} color="#64748b" style={styles.inputIcon} />
+              <Text style={styles.mmSectionLabel}>Your chambers</Text>
+              <ScrollView
+                style={{ flex: 1 }}
+                contentContainerStyle={{ paddingBottom: 28 }}
+                showsVerticalScrollIndicator={false}
+                keyboardShouldPersistTaps="handled"
+              >
+                {chambersList.length === 0 ? (
+                  <View style={styles.mmEmpty}>
+                    <Ionicons name="cube-outline" size={36} color="#94a3b8" />
+                    <Text style={styles.mmEmptyTitle}>No chambers yet</Text>
+                    <Text style={styles.mmEmptyText}>Add your first chamber above.</Text>
+                  </View>
+                ) : (
+                  chambersList.map((ch) => {
+                    const count = getClientsForChamber(ch.id).length;
+                    const selected = managerSelectedChamber?.id === ch.id;
+                    return (
+                      <TouchableOpacity
+                        key={ch.id}
+                        style={[styles.mmChamberRow, selected && styles.mmChamberRowSelected]}
+                        activeOpacity={0.75}
+                        onPress={() => {
+                          setManagerSelectedChamber(ch);
+                          setNewClientInput('');
+                          setEditingClientName(null);
+                          setMasterManagerTab('clients');
+                        }}
+                      >
+                        <View style={[styles.mmChamberIcon, selected && styles.mmChamberIconSelected]}>
+                          <Ionicons name="cube" size={18} color={selected ? '#003580' : '#64748b'} />
+                        </View>
+                        <View style={{ flex: 1 }}>
+                          <Text style={styles.mmChamberName}>{ch.name}</Text>
+                          <Text style={styles.mmChamberMeta}>
+                            {count === 0 ? 'No clients · tap to add' : `${count} client${count === 1 ? '' : 's'} · tap to manage`}
+                          </Text>
+                        </View>
+                        <TouchableOpacity
+                          onPress={() => handleDeleteChamberMaster(ch)}
+                          hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                          style={styles.mmIconBtnDanger}
+                        >
+                          <Ionicons name="trash-outline" size={16} color="#dc2626" />
+                        </TouchableOpacity>
+                        <Ionicons name="chevron-forward" size={18} color="#94a3b8" style={{ marginLeft: 4 }} />
+                      </TouchableOpacity>
+                    );
+                  })
+                )}
+              </ScrollView>
+            </View>
+          ) : (
+            <View style={styles.mmBody}>
+              {/* Chamber picker chips */}
+              <Text style={styles.mmSectionLabel}>Select chamber</Text>
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.mmChipRow}
+                style={{ flexGrow: 0, marginBottom: 10 }}
+              >
+                {chambersList.length === 0 ? (
+                  <TouchableOpacity
+                    style={styles.mmChipGhost}
+                    onPress={() => setMasterManagerTab('chambers')}
+                  >
+                    <Text style={styles.mmChipGhostText}>Add a chamber first</Text>
+                  </TouchableOpacity>
+                ) : (
+                  chambersList.map((ch) => {
+                    const active = managerSelectedChamber?.id === ch.id;
+                    return (
+                      <TouchableOpacity
+                        key={`chip-${ch.id}`}
+                        style={[styles.mmChip, active && styles.mmChipActive]}
+                        onPress={() => {
+                          setManagerSelectedChamber(ch);
+                          setNewClientInput('');
+                          setEditingClientName(null);
+                          setShowClientSuggestions(false);
+                        }}
+                        activeOpacity={0.85}
+                      >
+                        <Text style={[styles.mmChipText, active && styles.mmChipTextActive]}>{ch.name}</Text>
+                      </TouchableOpacity>
+                    );
+                  })
+                )}
+              </ScrollView>
+
+              {!managerSelectedChamber ? (
+                <View style={styles.mmEmpty}>
+                  <Ionicons name="people-outline" size={36} color="#94a3b8" />
+                  <Text style={styles.mmEmptyTitle}>Pick a chamber</Text>
+                  <Text style={styles.mmEmptyText}>
+                    Client names are per chamber — only that chamber will see them.
+                  </Text>
+                </View>
+              ) : (
+                <>
+                  <View style={styles.mmCard}>
+                    <Text style={styles.mmCardTitle}>
+                      Client master · {managerSelectedChamber.name}
+                    </Text>
+                    <Text style={styles.mmCardHint}>
+                      Default client master is pre-filled on every chamber. Customize per chamber
+                      (add / edit / delete) — Super Admin is notified on edit and delete.
+                    </Text>
+                    <View style={styles.mmAddRow}>
                       <TextInput
-                        style={styles.input}
-                        placeholder="e.g. Reliance Fresh"
+                        style={styles.mmTextInput}
+                        placeholder="Client lot name"
                         placeholderTextColor="#94a3b8"
                         value={newClientInput}
                         onChangeText={setNewClientInput}
                         autoCapitalize="words"
+                        returnKeyType="done"
+                        onSubmitEditing={handleAddNewClient}
                       />
+                      <TouchableOpacity
+                        style={styles.mmPrimaryBtn}
+                        onPress={handleAddNewClient}
+                        activeOpacity={0.85}
+                      >
+                        <Ionicons name="add" size={18} color="#fff" />
+                        <Text style={styles.mmPrimaryBtnText}>Add</Text>
+                      </TouchableOpacity>
                     </View>
-                    <TouchableOpacity 
-                      style={[styles.submitBtn, { marginTop: 0, paddingHorizontal: 16, height: 42 }]} 
-                      onPress={handleAddNewClient}
+
+                    <TouchableOpacity
+                      style={styles.mmSuggestToggle}
+                      onPress={() => setShowClientSuggestions((v) => !v)}
+                      activeOpacity={0.8}
                     >
-                      <Text style={styles.submitBtnText}>Add</Text>
+                      <Text style={styles.mmSuggestToggleText}>
+                        {showClientSuggestions ? 'Hide suggestions' : 'Show name suggestions'}
+                      </Text>
+                      <Ionicons
+                        name={showClientSuggestions ? 'chevron-up' : 'chevron-down'}
+                        size={16}
+                        color="#003580"
+                      />
                     </TouchableOpacity>
+
+                    {showClientSuggestions && (
+                      <View style={styles.mmSuggestWrap}>
+                        {masterClientLots.map((name) => {
+                          const already = chamberClients.some(
+                            (a) => String(a.client_name).toLowerCase() === name.toLowerCase()
+                          );
+                          return (
+                            <TouchableOpacity
+                              key={name}
+                              disabled={already}
+                              style={[styles.mmSuggestChip, already && styles.mmSuggestChipUsed]}
+                              onPress={() => {
+                                const success = addLocalAssignment(
+                                  managerSelectedChamber.id,
+                                  managerSelectedChamber.name,
+                                  name,
+                                  'Added for this chamber only'
+                                );
+                                if (success) {
+                                  loadLocalAssignmentsData(chambersList);
+                                  reportDOActivity(
+                                    'ADD_CLIENT',
+                                    `Added client "${name}" to ${managerSelectedChamber.name} only`,
+                                    'Added for this chamber only'
+                                  );
+                                  if (apiUrl && token) triggerSync(apiUrl, token, setSyncStatus);
+                                }
+                              }}
+                            >
+                              <Text
+                                style={[styles.mmSuggestChipText, already && styles.mmSuggestChipTextUsed]}
+                                numberOfLines={1}
+                              >
+                                {already ? `✓ ${name}` : `+ ${name}`}
+                              </Text>
+                            </TouchableOpacity>
+                          );
+                        })}
+                      </View>
+                    )}
                   </View>
-                </View>
 
-              </View>
-            ) : (
-              <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center', padding: 30 }}>
-                <Ionicons name="file-tray-full-outline" size={48} color="#94a3b8" />
-                <Text style={{ fontSize: 13, color: '#64748b', textAlign: 'center', marginTop: 10, fontWeight: '500' }}>
-                  Please select a chamber from the dropdown above to manage its client list.
-                </Text>
-              </View>
-            )}
+                  <Text style={styles.mmSectionLabel}>
+                    Clients on {managerSelectedChamber.name} ({chamberClients.length})
+                  </Text>
 
-          </View>
+                  <ScrollView
+                    style={{ flex: 1 }}
+                    contentContainerStyle={{ paddingBottom: 28 }}
+                    showsVerticalScrollIndicator={false}
+                    keyboardShouldPersistTaps="handled"
+                  >
+                    {chamberClients.length === 0 ? (
+                      <View style={styles.mmEmptyCompact}>
+                        <Text style={styles.mmEmptyText}>
+                          No clients yet. Add a name above — it stays on this chamber only.
+                        </Text>
+                      </View>
+                    ) : (
+                      chamberClients.map((item) => {
+                        const isEditing =
+                          editingClientName &&
+                          Number(editingClientName.chamberId) === Number(managerSelectedChamber.id) &&
+                          editingClientName.oldName === item.client_name;
+                        return (
+                          <View key={item.client_name} style={styles.mmClientRow}>
+                            {isEditing ? (
+                              <View style={styles.mmAddRow}>
+                                <TextInput
+                                  style={styles.mmTextInput}
+                                  value={editClientDraft}
+                                  onChangeText={setEditClientDraft}
+                                  autoCapitalize="words"
+                                  placeholder="New name"
+                                  placeholderTextColor="#94a3b8"
+                                  autoFocus
+                                />
+                                <TouchableOpacity
+                                  style={styles.mmIconBtnSuccess}
+                                  onPress={handleRenameChamberClient}
+                                >
+                                  <Ionicons name="checkmark" size={18} color="#15803d" />
+                                </TouchableOpacity>
+                                <TouchableOpacity
+                                  style={styles.mmIconBtnNeutral}
+                                  onPress={() => {
+                                    setEditingClientName(null);
+                                    setEditClientDraft('');
+                                  }}
+                                >
+                                  <Ionicons name="close" size={18} color="#64748b" />
+                                </TouchableOpacity>
+                              </View>
+                            ) : (
+                              <>
+                                <View style={styles.mmClientAvatar}>
+                                  <Text style={styles.mmClientAvatarText}>
+                                    {String(item.client_name).charAt(0).toUpperCase()}
+                                  </Text>
+                                </View>
+                                <Text style={styles.mmClientName} numberOfLines={1}>
+                                  {item.client_name}
+                                </Text>
+                                <TouchableOpacity
+                                  style={styles.mmIconBtnNeutral}
+                                  onPress={() => {
+                                    setEditingClientName({
+                                      chamberId: managerSelectedChamber.id,
+                                      oldName: item.client_name
+                                    });
+                                    setEditClientDraft(item.client_name);
+                                  }}
+                                >
+                                  <Ionicons name="create-outline" size={16} color="#0369a1" />
+                                </TouchableOpacity>
+                                <TouchableOpacity
+                                  style={styles.mmIconBtnDanger}
+                                  onPress={() => handleDeleteClient(item.client_name)}
+                                >
+                                  <Ionicons name="trash-outline" size={16} color="#dc2626" />
+                                </TouchableOpacity>
+                              </>
+                            )}
+                          </View>
+                        );
+                      })
+                    )}
+                  </ScrollView>
+                </>
+              )}
+            </View>
+          )}
         </SafeAreaView>
       </Modal>
     );
@@ -3900,20 +5487,25 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
 
   // 4. CUSTOM CLIENT DELETION REMARK/CONFIRM MODAL
   const renderDeleteConfirmModal = () => {
+    const isChamberDeleteRequest = clientToDelete?.type === 'chamber_delete_request';
     return (
       <Modal visible={showDeleteConfirmModal} animationType="fade" transparent>
         <View style={styles.dialogOverlay}>
           <View style={styles.dialogContent}>
-            <Text style={styles.dialogTitle}>Delete Client Assignment</Text>
+            <Text style={styles.dialogTitle}>
+              {isChamberDeleteRequest ? 'Request Chamber Delete' : 'Delete Client Master'}
+            </Text>
             <Text style={styles.dialogSubtitle}>
-              Please enter a remark/reason for removing "{clientToDelete?.clientName}" from {clientToDelete?.chamberName || 'Chamber'}:
+              {isChamberDeleteRequest
+                ? `Enter remark/reason to request Super Admin allow for deleting "${clientToDelete?.chamberName}":`
+                : `Please enter a remark/reason for removing "${clientToDelete?.clientName}" from ${clientToDelete?.chamberName || 'Chamber'}:`}
             </Text>
             
             <TextInput
               style={styles.dialogInput}
               value={deleteRemarkInput}
               onChangeText={setDeleteRemarkInput}
-              placeholder="e.g. Inward Lot Completed"
+              placeholder={isChamberDeleteRequest ? 'e.g. Chamber decommissioned' : 'e.g. Inward Lot Completed'}
               autoCapitalize="sentences"
             />
 
@@ -3930,36 +5522,64 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
               </TouchableOpacity>
               <TouchableOpacity 
                 style={[styles.dialogSaveBtn, { backgroundColor: '#ef4444' }]}
-                onPress={() => {
+                onPress={async () => {
                   if (!deleteRemarkInput.trim()) {
                     Alert.alert('Validation Error', 'Please enter a deletion remark/reason.');
                     return;
                   }
-                  const success = deleteLocalAssignment(clientToDelete.chamberId, clientToDelete.clientName, deleteRemarkInput.trim());
+                  const target = clientToDelete;
+                  if (!target) return;
+                  const remark = deleteRemarkInput.trim();
+
+                  if (target.type === 'chamber_delete_request') {
+                    setShowDeleteConfirmModal(false);
+                    setDeleteRemarkInput('');
+                    setClientToDelete(null);
+                    await requestChamberDeletePermission(
+                      { id: target.chamberId, name: target.chamberName },
+                      remark
+                    );
+                    return;
+                  }
+
+                  const success = deleteLocalAssignment(
+                    target.chamberId,
+                    target.clientName,
+                    remark
+                  );
                   if (success) {
                     setShowDeleteConfirmModal(false);
                     setDeleteRemarkInput('');
-                    loadLocalAssignmentsData();
-                    reportDOActivity('DELETE_CLIENT', `Deleted client "${clientToDelete.clientName}" from ${clientToDelete.chamberName} with remark: ${deleteRemarkInput.trim()}`);
+                    loadLocalAssignmentsData(chambersList);
+                    reportDOActivity(
+                      'DELETE_CLIENT',
+                      `${displayName} deleted client master "${target.clientName}" from ${target.chamberName} (chamber_id: ${target.chamberId}). Remark: ${remark}`,
+                      remark
+                    );
                     if (apiUrl && token) triggerSync(apiUrl, token, setSyncStatus);
-                    
-                    // Reset selected client if it was deleted
-                    if (selectedClient === clientToDelete.clientName) {
+                    if (target.permissionNotifId) {
+                      markPermissionNotificationComplete(target.permissionNotifId);
+                    }
+                    if (selectedClient === target.clientName) {
                       setSelectedClient(null);
                       setTempInput('');
                       setBoxCountInput('');
                       setCapturedImage(null);
                       setCapturedImageTimestamp(null);
                     }
-                    
                     setClientToDelete(null);
-                    Alert.alert('Deleted', 'Client deleted successfully from SQLite database.');
+                    Alert.alert(
+                      'Deleted',
+                      `"${target.clientName}" removed from ${target.chamberName}. Super Admin has been notified.`
+                    );
                   } else {
                     Alert.alert('Error', 'Failed to delete client locally.');
                   }
                 }}
               >
-                <Text style={styles.dialogSaveBtnText}>Confirm Delete</Text>
+                <Text style={styles.dialogSaveBtnText}>
+                  {isChamberDeleteRequest ? 'Send Request' : 'Confirm Delete'}
+                </Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -4487,7 +6107,66 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
     );
   };
 
-  // 5. ADD CLIENT MODAL DIALOG (CENTERED POPUP)
+  // 5. ADD CHAMBER MODAL (name + remark → SA allow)
+  const renderAddChamberModal = () => {
+    return (
+      <Modal visible={showAddChamberModal} animationType="fade" transparent>
+        <View style={styles.dialogOverlay}>
+          <View style={styles.dialogContent}>
+            <Text style={styles.dialogTitle}>Request Add Chamber</Text>
+            <Text style={styles.dialogSubtitle}>
+              Fill chamber name and remark, then send request. Super Admin will allow it in Role & Permission.
+            </Text>
+
+            <Text style={[styles.modalLabel, { fontSize: 11, marginBottom: 4 }]}>Chamber Name *</Text>
+            <TextInput
+              style={styles.dialogInput}
+              placeholder="e.g. Chamber 3 / Cold Store A"
+              placeholderTextColor="#94a3b8"
+              value={addChamberNameInput}
+              onChangeText={setAddChamberNameInput}
+              autoCapitalize="words"
+            />
+
+            <Text style={[styles.modalLabel, { fontSize: 11, marginBottom: 4 }]}>Remark / Reason *</Text>
+            <TextInput
+              style={styles.dialogInput}
+              placeholder="e.g. New dock line activated"
+              placeholderTextColor="#94a3b8"
+              value={addChamberRemarkInput}
+              onChangeText={setAddChamberRemarkInput}
+              autoCapitalize="sentences"
+            />
+
+            <View style={styles.dialogActionsRow}>
+              <TouchableOpacity
+                style={styles.dialogCancelBtn}
+                disabled={addChamberBusy}
+                onPress={() => {
+                  setShowAddChamberModal(false);
+                  setAddChamberNameInput('');
+                  setAddChamberRemarkInput('');
+                }}
+              >
+                <Text style={styles.dialogCancelBtnText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.dialogSaveBtn, addChamberBusy && { opacity: 0.7 }]}
+                disabled={addChamberBusy}
+                onPress={submitAddChamberRequest}
+              >
+                <Text style={styles.dialogSaveBtnText}>
+                  {addChamberBusy ? 'Sending…' : 'Send Request'}
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+    );
+  };
+
+  // 5b. ADD CLIENT MODAL DIALOG (CENTERED POPUP)
   const renderAddClientModal = () => {
     return (
       <Modal visible={showAddClientModal} animationType="fade" transparent>
@@ -4538,9 +6217,9 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
                     Alert.alert('Validation Error', 'Please enter an addition remark.');
                     return;
                   }
-                  const name = inlineClientInput.trim();
+                  const name = ensureClientInLotMaster(inlineClientInput);
                   const remark = inlineRemarkInput.trim();
-                  const exists = assignments.some(item => item.chamber_id === selectedChamber.id && item.client_name.toLowerCase() === name.toLowerCase());
+                  const exists = assignments.some(item => Number(item.chamber_id) === Number(selectedChamber.id) && item.client_name.toLowerCase() === name.toLowerCase());
                   if (exists) {
                     Alert.alert('Duplicate Client', `"${name}" is already in the list.`);
                     return;
@@ -4551,8 +6230,8 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
                     setInlineClientInput('');
                     setInlineRemarkInput('');
                     setShowAddClientModal(false);
-                    loadLocalAssignmentsData();
-                    reportDOActivity('ADD_CLIENT', `Added client "${name}" inline to ${selectedChamber.name} with remark: ${remark}`);
+                    loadLocalAssignmentsData(chambersList);
+                    reportDOActivity('ADD_CLIENT', `Added client "${name}" to ${selectedChamber.name} only with remark: ${remark}`, remark);
                     if (apiUrl && token) triggerSync(apiUrl, token, setSyncStatus);
                     setSelectedClient(name);
                     setTempInput('');
@@ -4613,18 +6292,7 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
           <TouchableOpacity 
             style={styles.fabBtn} 
             activeOpacity={0.8}
-            onPress={() => {
-              setOpenedFromFab(true);
-              setSelectedChamber(null); 
-              setSelectedClient(null);
-              setTempInput('');
-              setBoxCountInput('');
-              setCapturedImage(null);
-              setCapturedImageTimestamp(null);
-              setSelectedChamberType('Frozen');
-              setIsProfileEditable(true);
-              setShowLogModal(true);
-            }}
+            onPress={openMasterManager}
           >
             <Ionicons name="add" size={32} color="#ffffff" />
           </TouchableOpacity>
@@ -4739,6 +6407,7 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
       {renderTaskProfileModal()}
       {renderClientManagerModal()}
       {renderDeleteConfirmModal()}
+      {renderAddChamberModal()}
       {renderAddClientModal()}
       {renderSubmitConfirmModal()}
       {renderPermissionModal()}
@@ -4746,6 +6415,7 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout }) {
       {renderInventoryModal()}
       {renderHistoryModal()}
       {renderNotificationsModal()}
+      {renderCalendarModal()}
 
       {/* Navigation Tab Bar Overlay */}
       {renderBottomTabBar()}
@@ -5444,6 +7114,351 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
   },
 
+  // Master Setup (Manage Chambers / Clients)
+  mmRoot: {
+    flex: 1,
+    backgroundColor: '#f1f5f9',
+  },
+  mmHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingTop: 8,
+    paddingBottom: 12,
+    backgroundColor: '#ffffff',
+    borderBottomWidth: 1,
+    borderBottomColor: '#e2e8f0',
+  },
+  mmHeaderTextWrap: {
+    flex: 1,
+    paddingRight: 8,
+  },
+  mmHeaderTitle: {
+    fontSize: 18,
+    fontWeight: '800',
+    color: '#0f172a',
+  },
+  mmHeaderSub: {
+    marginTop: 2,
+    fontSize: 12,
+    color: '#64748b',
+    fontWeight: '500',
+  },
+  mmCloseBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: '#f1f5f9',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  mmTabs: {
+    flexDirection: 'row',
+    marginHorizontal: 16,
+    marginTop: 12,
+    marginBottom: 8,
+    padding: 4,
+    backgroundColor: '#e2e8f0',
+    borderRadius: 12,
+  },
+  mmTab: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    paddingVertical: 10,
+    borderRadius: 10,
+  },
+  mmTabActive: {
+    backgroundColor: '#ffffff',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.06,
+    shadowRadius: 2,
+    elevation: 1,
+  },
+  mmTabText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#64748b',
+  },
+  mmTabTextActive: {
+    color: '#003580',
+  },
+  mmBody: {
+    flex: 1,
+    paddingHorizontal: 16,
+    paddingTop: 4,
+  },
+  mmCard: {
+    backgroundColor: '#ffffff',
+    borderRadius: 14,
+    padding: 14,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+    marginBottom: 12,
+  },
+  mmCardTitle: {
+    fontSize: 14,
+    fontWeight: '800',
+    color: '#0f172a',
+    marginBottom: 4,
+  },
+  mmCardHint: {
+    fontSize: 11,
+    color: '#64748b',
+    marginBottom: 10,
+    lineHeight: 15,
+  },
+  mmAddRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  mmTextInput: {
+    flex: 1,
+    height: 44,
+    borderWidth: 1,
+    borderColor: '#cbd5e1',
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    fontSize: 14,
+    color: '#0f172a',
+    backgroundColor: '#f8fafc',
+  },
+  mmPrimaryBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: '#003580',
+    height: 44,
+    paddingHorizontal: 14,
+    borderRadius: 10,
+  },
+  mmPrimaryBtnDisabled: {
+    backgroundColor: '#94a3b8',
+  },
+  mmPrimaryBtnText: {
+    color: '#ffffff',
+    fontWeight: '800',
+    fontSize: 13,
+  },
+  mmSectionLabel: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: '#64748b',
+    textTransform: 'uppercase',
+    letterSpacing: 0.4,
+    marginBottom: 8,
+    marginTop: 2,
+  },
+  mmChamberRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#ffffff',
+    borderRadius: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    marginBottom: 8,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+  },
+  mmChamberRowSelected: {
+    borderColor: '#93c5fd',
+    backgroundColor: '#f8fbff',
+  },
+  mmChamberIcon: {
+    width: 36,
+    height: 36,
+    borderRadius: 10,
+    backgroundColor: '#f1f5f9',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 10,
+  },
+  mmChamberIconSelected: {
+    backgroundColor: '#dbeafe',
+  },
+  mmChamberName: {
+    fontSize: 14,
+    fontWeight: '800',
+    color: '#0f172a',
+  },
+  mmChamberMeta: {
+    fontSize: 11,
+    color: '#64748b',
+    marginTop: 2,
+    fontWeight: '500',
+  },
+  mmIconBtnDanger: {
+    width: 34,
+    height: 34,
+    borderRadius: 8,
+    backgroundColor: '#fef2f2',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: '#fecaca',
+  },
+  mmIconBtnNeutral: {
+    width: 34,
+    height: 34,
+    borderRadius: 8,
+    backgroundColor: '#f1f5f9',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginLeft: 6,
+  },
+  mmIconBtnSuccess: {
+    width: 34,
+    height: 34,
+    borderRadius: 8,
+    backgroundColor: '#dcfce7',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  mmChipRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingRight: 8,
+  },
+  mmChip: {
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+    borderRadius: 20,
+    backgroundColor: '#ffffff',
+    borderWidth: 1,
+    borderColor: '#cbd5e1',
+  },
+  mmChipActive: {
+    backgroundColor: '#003580',
+    borderColor: '#003580',
+  },
+  mmChipText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#475569',
+  },
+  mmChipTextActive: {
+    color: '#ffffff',
+  },
+  mmChipGhost: {
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+    borderRadius: 20,
+    backgroundColor: '#fff7ed',
+    borderWidth: 1,
+    borderColor: '#fed7aa',
+  },
+  mmChipGhostText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#c2410c',
+  },
+  mmClientRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#ffffff',
+    borderRadius: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    marginBottom: 8,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+  },
+  mmClientAvatar: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: '#e0f2fe',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 10,
+  },
+  mmClientAvatarText: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: '#0369a1',
+  },
+  mmClientName: {
+    flex: 1,
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#0f172a',
+    marginRight: 8,
+  },
+  mmSuggestToggle: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginTop: 12,
+    paddingTop: 10,
+    borderTopWidth: 1,
+    borderTopColor: '#f1f5f9',
+  },
+  mmSuggestToggleText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#003580',
+  },
+  mmSuggestWrap: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 10,
+  },
+  mmSuggestChip: {
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    borderRadius: 8,
+    backgroundColor: '#eff6ff',
+    borderWidth: 1,
+    borderColor: '#bfdbfe',
+    maxWidth: '100%',
+  },
+  mmSuggestChipUsed: {
+    backgroundColor: '#f1f5f9',
+    borderColor: '#e2e8f0',
+  },
+  mmSuggestChipText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#1d4ed8',
+  },
+  mmSuggestChipTextUsed: {
+    color: '#94a3b8',
+  },
+  mmEmpty: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 48,
+    paddingHorizontal: 24,
+  },
+  mmEmptyCompact: {
+    paddingVertical: 20,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderStyle: 'dashed',
+    borderColor: '#cbd5e1',
+    backgroundColor: '#ffffff',
+  },
+  mmEmptyTitle: {
+    marginTop: 10,
+    fontSize: 15,
+    fontWeight: '800',
+    color: '#334155',
+  },
+  mmEmptyText: {
+    marginTop: 6,
+    fontSize: 12,
+    color: '#64748b',
+    textAlign: 'center',
+    lineHeight: 17,
+  },
+
   // Task Log Modal with unified columns
   modalOverlay: {
     flex: 1,
@@ -5574,6 +7589,26 @@ const styles = StyleSheet.create({
     shadowRadius: 8,
     width: '100%',
     zIndex: 9999,
+  },
+  // Inline (non-absolute) — works inside ScrollView on Android
+  dropdownListInline: {
+    marginTop: 6,
+    backgroundColor: '#ffffff',
+    borderWidth: 1,
+    borderColor: '#cbd5e1',
+    borderRadius: 8,
+    paddingVertical: 2,
+    maxHeight: 200,
+    overflow: 'hidden',
+  },
+  reportFilterDropdownInline: {
+    marginTop: 6,
+    backgroundColor: '#ffffff',
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+    maxHeight: 180,
+    overflow: 'hidden',
   },
   dropdownItem: {
     flexDirection: 'row',
@@ -5936,6 +7971,43 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   reportRangePickChipTextActive: {
+    color: '#003580',
+  },
+  reportDateRangeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 8,
+  },
+  reportDateRangeBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: '#ffffff',
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+  },
+  reportDateRangeBtnText: {
+    flex: 1,
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#0f172a',
+  },
+  reportDateTodayBtn: {
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: 10,
+    backgroundColor: '#eff6ff',
+    borderWidth: 1,
+    borderColor: '#bfdbfe',
+  },
+  reportDateTodayBtnText: {
+    fontSize: 12,
+    fontWeight: '700',
     color: '#003580',
   },
   reportFiltersRow: {

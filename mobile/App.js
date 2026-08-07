@@ -4,46 +4,46 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import LoginScreen from './src/screens/LoginScreen';
 import DashboardScreen from './src/screens/DashboardScreen';
 
-// Automatically detect local machine IP in development (from Metro bundler)
-const getApiBaseUrl = () => {
-  const DEFAULT_IP = '192.168.147.129'; // Your computer's current local Wi-Fi IP
-  if (__DEV__) {
-    try {
-      const scriptURL = NativeModules.SourceCode?.scriptURL || '';
-      const address = scriptURL.split('://')[1] || '';
-      const host = address.split('/')[0] || '';
-      const ip = host.split(':')[0];
-      
-      if (ip) {
-        // If running in emulator, route to correct loopback host alias
-        if (ip === 'localhost' || ip === '127.0.0.1' || ip === '10.0.2.2' || ip === '::1') {
-          return Platform.OS === 'android' ? 'http://10.0.2.2:5000' : 'http://localhost:5000';
-        }
-        // If it's a valid IPv4 network address, use it
-        if (/^\d+\.\d+\.\d+\.\d+$/.test(ip)) {
-          return `http://${ip}:5000`;
-        }
-      }
-    } catch (e) {
-      console.warn('Failed to dynamically detect backend IP, using fallback.', e);
-    }
-    // Fallback for physical devices
-    return `http://${DEFAULT_IP}:5000`;
-  }
-  // Production URL fallback
-  return 'https://reeferon-crm-backend.onrender.com';
-};
+/** Render production API (no trailing slash, no /api) */
+export const PRODUCTION_API_URL = 'https://reeferon-crm-backend.onrender.com';
 
-const API_BASE_URL = getApiBaseUrl();
+/** Fallback LAN IP if Metro host cannot be detected */
+const FALLBACK_LOCAL_IP = '192.168.147.129';
+
+/** Detect local backend URL from Metro bundler (Expo Go / emulator). */
+export function getLocalApiUrl() {
+  try {
+    const scriptURL = NativeModules.SourceCode?.scriptURL || '';
+    const address = scriptURL.split('://')[1] || '';
+    const host = address.split('/')[0] || '';
+    const ip = host.split(':')[0];
+
+    if (ip) {
+      if (ip === 'localhost' || ip === '127.0.0.1' || ip === '10.0.2.2' || ip === '::1') {
+        return Platform.OS === 'android' ? 'http://10.0.2.2:5000' : 'http://localhost:5000';
+      }
+      if (/^\d+\.\d+\.\d+\.\d+$/.test(ip)) {
+        return `http://${ip}:5000`;
+      }
+    }
+  } catch (e) {
+    console.warn('Failed to detect local API host:', e);
+  }
+  return `http://${FALLBACK_LOCAL_IP}:5000`;
+}
+
+export function isProductionApiUrl(url) {
+  if (!url || typeof url !== 'string') return false;
+  const u = url.trim().toLowerCase();
+  return u.includes('onrender.com') || u.startsWith('https://');
+}
 
 export default function App() {
-  // Authentication session state tracking user details and JWT token
-  const [apiUrl, setApiUrl] = useState(API_BASE_URL);
+  const [apiUrl, setApiUrl] = useState(PRODUCTION_API_URL);
   const [user, setUser] = useState(null);
   const [token, setToken] = useState(null);
   const [loading, setLoading] = useState(true);
 
-  // Restore session from AsyncStorage on app startup
   useEffect(() => {
     const restoreSession = async () => {
       try {
@@ -54,8 +54,12 @@ export default function App() {
           setToken(storedToken);
           setUser(JSON.parse(storedUser));
         }
-        if (storedApiUrl) {
-          setApiUrl(storedApiUrl);
+        // Restore last chosen server (production or local)
+        if (storedApiUrl && storedApiUrl.trim()) {
+          setApiUrl(storedApiUrl.replace(/\/$/, ''));
+        } else {
+          setApiUrl(PRODUCTION_API_URL);
+          await AsyncStorage.setItem('api_url', PRODUCTION_API_URL);
         }
       } catch (err) {
         console.warn('Failed to restore session:', err);
@@ -66,11 +70,9 @@ export default function App() {
     restoreSession();
   }, []);
 
-  // Deep link: reeferon://login (dev/production build) or Expo Go exp://…/--/login
   useEffect(() => {
     const handleUrl = (url) => {
       if (!url) return;
-      // Opening the app is enough — Login screen shows when logged out
       console.log('[deep-link]', url);
     };
 
@@ -79,11 +81,6 @@ export default function App() {
     return () => sub.remove();
   }, []);
 
-  /**
-   * Callback fired upon successful credential verification.
-   * Sets token and user details dynamically.
-   * @param {Object} sessionData - Contains { user, token }
-   */
   const handleLoginSuccess = async (sessionData) => {
     setUser(sessionData.user);
     setToken(sessionData.token);
@@ -95,22 +92,16 @@ export default function App() {
     }
   };
 
-  /**
-   * Updates the server base API URL and persists it in AsyncStorage.
-   * @param {string} newUrl - The new API base URL
-   */
   const handleUpdateApiUrl = async (newUrl) => {
     try {
-      setApiUrl(newUrl);
-      await AsyncStorage.setItem('api_url', newUrl);
+      const clean = String(newUrl || '').trim().replace(/\/$/, '');
+      setApiUrl(clean);
+      await AsyncStorage.setItem('api_url', clean);
     } catch (err) {
       console.warn('Failed to save API URL:', err);
     }
   };
 
-  /**
-   * Clears the user session and redirects back to the Sign-In screen.
-   */
   const handleLogout = async () => {
     setUser(null);
     setToken(null);
@@ -133,15 +124,20 @@ export default function App() {
   return (
     <View style={styles.container}>
       {!user || !token ? (
-        // Render Login Screen if user session is not active
-        <LoginScreen onLoginSuccess={handleLoginSuccess} apiUrl={apiUrl} onUpdateApiUrl={handleUpdateApiUrl} />
+        <LoginScreen
+          onLoginSuccess={handleLoginSuccess}
+          apiUrl={apiUrl}
+          onUpdateApiUrl={handleUpdateApiUrl}
+          productionApiUrl={PRODUCTION_API_URL}
+          localApiUrl={getLocalApiUrl()}
+        />
       ) : (
-        // Render Dashboard Screen with user session and token context
-        <DashboardScreen 
-          user={user} 
-          token={token} 
-          apiUrl={apiUrl} 
-          onLogout={handleLogout} 
+        <DashboardScreen
+          user={user}
+          token={token}
+          apiUrl={apiUrl}
+          onLogout={handleLogout}
+          onUserUpdate={setUser}
         />
       )}
     </View>

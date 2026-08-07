@@ -33,7 +33,14 @@ services:
       - key: RESEND_API_KEY
         sync: false
       - key: EMAIL_FROM
-        sync: false
+        value: ReeferON <onboarding@resend.dev>
+      # SMTP disabled — use Resend on Render
+      # - key: SMTP_HOST
+      #   value: smtp.gmail.com
+      # - key: SMTP_USER
+      #   sync: false
+      # - key: SMTP_PASS
+      #   sync: false
       - key: APP_LOGIN_URL
         sync: false
       - key: LOG_ALL_STATUS

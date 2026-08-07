@@ -19,6 +19,7 @@
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
       "package": "com.reeferon.crm",
+      "versionCode": 1,
       "intentFilters": [
         {
           "action": "VIEW",
