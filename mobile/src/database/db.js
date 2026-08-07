@@ -247,8 +247,20 @@ export const cacheAssignments = (assignments) => {
       );
     }
 
-    // Re-insert pending assignments
+    // Re-insert pending assignments (skip old demo auto-seed rows)
+    const demoNames = new Set(
+      DEFAULT_CLIENT_LOT_MASTER.map((n) => String(n).trim().toLowerCase())
+    );
     for (const item of pending) {
+      const remark = String(item.remark || '').trim().toLowerCase();
+      const cname = String(item.client_name || '').trim().toLowerCase();
+      if (
+        remark === 'default client master' ||
+        remark === 'master client lot' ||
+        demoNames.has(cname)
+      ) {
+        continue;
+      }
       if (item.action === 'add') {
         db.runSync(
           "INSERT OR REPLACE INTO local_assignments (chamber_id, chamber_name, client_name, remark, status, sync_status, action) VALUES (?, ?, ?, ?, 'active', 'pending', 'add');",
@@ -536,17 +548,29 @@ export const seedDefaultClientsForEmptyChambers = (chambers) => {
 };
 
 /**
- * One-time cleanup: remove auto-seeded "Master client lot" rows so each chamber
- * only keeps clients the DO explicitly manages.
+ * Remove auto-seeded example client rows (by remark or known demo names).
  */
 export const purgeAutoSeededMasterLotsOnce = () => {
   if (!db) return 0;
   try {
-    const result = db.runSync(
-      "DELETE FROM local_assignments WHERE remark = ?;",
-      ['Master client lot']
+    let n = 0;
+    const byRemark = db.runSync(
+      `DELETE FROM local_assignments
+       WHERE remark IN (?, ?)
+          OR LOWER(TRIM(IFNULL(remark, ''))) = 'default client master';`,
+      ['Master client lot', 'Default client master']
     );
-    const n = result?.changes || 0;
+    n += Number(byRemark?.changes || 0);
+
+    // Also wipe known demo lot names left after sync (remark often dropped)
+    for (const name of DEFAULT_CLIENT_LOT_MASTER) {
+      const r = db.runSync(
+        `DELETE FROM local_assignments WHERE LOWER(TRIM(client_name)) = LOWER(?)`,
+        [name]
+      );
+      n += Number(r?.changes || 0);
+    }
+
     if (n > 0) console.log(`🧹 Purged ${n} auto-seeded chamber client lots.`);
     return n;
   } catch (error) {

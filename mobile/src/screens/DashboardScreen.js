@@ -37,7 +37,7 @@ import {
   addLocalAssignment,
   deleteLocalAssignment,
   renameLocalAssignment,
-  seedDefaultClientsForEmptyChambers,
+  purgeAutoSeededMasterLotsOnce,
   getClientLotMaster,
   addClientLotMaster,
   DEFAULT_CLIENT_LOT_MASTER
@@ -123,50 +123,11 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
     return permissionNotifications;
   };
 
+  /** Chamber completion target = Master Setup client count for that chamber. */
   const getChamberClientTarget = (chamberId) => {
     if (chamberId == null) return null;
-    const raw = chamberClientTargets[String(chamberId)];
-    const n = parseInt(raw, 10);
-    return Number.isFinite(n) && n >= 1 ? n : null;
-  };
-
-  const saveChamberClientTarget = async (chamberId, value) => {
-    if (chamberId == null) return null;
-    const digits = String(value ?? '').replace(/[^\d]/g, '');
-    let nextTargets;
-    let savedVal = null;
-    if (!digits) {
-      nextTargets = { ...chamberClientTargets };
-      delete nextTargets[String(chamberId)];
-      setChamberClientTargets(nextTargets);
-      try {
-        await AsyncStorage.setItem('chamber_client_targets', JSON.stringify(nextTargets));
-      } catch (_) {}
-      savedVal = null;
-    } else {
-      const n = Math.max(1, Math.min(50, parseInt(digits, 10) || 1));
-      nextTargets = { ...chamberClientTargets, [String(chamberId)]: n };
-      setChamberClientTargets(nextTargets);
-      try {
-        await AsyncStorage.setItem('chamber_client_targets', JSON.stringify(nextTargets));
-      } catch (_) {}
-      savedVal = n;
-    }
-    // Persist to MySQL so Super Admin / other devices stay in sync
-    try {
-      if (apiUrl && token) {
-        await fetch(`${apiUrl}/api/chambers/${chamberId}`, {
-          method: 'PUT',
-          headers: {
-            Authorization: `Bearer ${token}`,
-            'Content-Type': 'application/json',
-            Accept: 'application/json'
-          },
-          body: JSON.stringify({ total_clients: savedVal })
-        });
-      }
-    } catch (_) {}
-    return savedVal;
+    const n = getClientsForChamber(chamberId).length;
+    return n >= 1 ? n : null;
   };
 
   /** Unique clients logged for chamber + shift on a date */
@@ -255,9 +216,7 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
             'DELETE_CLIENT',
             'UPDATE_CLIENT',
             'ADD_CHAMBER',
-            'DELETE_CHAMBER',
-            'REQUEST_EDIT',
-            'REQUEST_DELETE'
+            'DELETE_CHAMBER'
           ].includes(String(action))
             ? 'DO_CHANGE'
             : 'activity',
@@ -469,9 +428,6 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
   const [inlineClientInput, setInlineClientInput] = useState('');
   const [inlineRemarkInput, setInlineRemarkInput] = useState('');
   const [selectedChamberType, setSelectedChamberType] = useState('Frozen');
-  /** User-typed target: how many clients must be logged for chamber to be fully complete { [chamberId]: 1|2|3|4... } */
-  const [chamberClientTargets, setChamberClientTargets] = useState({});
-  const [totalClientsDraft, setTotalClientsDraft] = useState(''); // form input while modal open
   
   // Custom Client Deletion Reason Modal States
   const [showDeleteConfirmModal, setShowDeleteConfirmModal] = useState(false);
@@ -501,39 +457,30 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
   const [syncStatus, setSyncStatus] = useState('idle'); // 'idle' | 'syncing'
   const [refreshing, setRefreshing] = useState(false);
 
-  const isMorningCompleted = useMemo(() => {
-    const activeAssignments = assignments.filter(item => item.status !== 'inactive');
-    if (activeAssignments.length === 0) return false;
-    
+  /** True when every Master Setup client on every chamber is logged for this shift today. */
+  const isShiftFullyCompleted = (shiftName) => {
     const todayStr = new Date().toISOString().split('T')[0];
-    const hasPendingMorning = activeAssignments.some(item => {
-      const log = completedLogs.find(l => 
-        l.chamber_id === item.chamber_id && 
-        l.client_name === item.client_name && 
-        l.entry_date === todayStr &&
-        l.shift === 'Morning'
-      );
-      return !log;
-    });
-    return !hasPendingMorning;
-  }, [assignments, completedLogs]);
+    const chambersWithClients = (chambersList || []).filter(
+      (ch) => getClientsForChamber(ch.id).length > 0
+    );
+    if (chambersWithClients.length === 0) return false;
 
-  const isEveningCompleted = useMemo(() => {
-    const activeAssignments = assignments.filter(item => item.status !== 'inactive');
-    if (activeAssignments.length === 0) return false;
-    
-    const todayStr = new Date().toISOString().split('T')[0];
-    const hasPendingEvening = activeAssignments.some(item => {
-      const log = completedLogs.find(l => 
-        l.chamber_id === item.chamber_id && 
-        l.client_name === item.client_name && 
-        l.entry_date === todayStr &&
-        l.shift === 'Evening'
-      );
-      return !log;
+    return chambersWithClients.every((ch) => {
+      const clients = getClientsForChamber(ch.id);
+      const done = countLoggedClientsForChamber(ch.id, shiftName, todayStr);
+      return done >= clients.length;
     });
-    return !hasPendingEvening;
-  }, [assignments, completedLogs]);
+  };
+
+  const isMorningCompleted = useMemo(
+    () => isShiftFullyCompleted('Morning'),
+    [assignments, completedLogs, chambersList]
+  );
+
+  const isEveningCompleted = useMemo(
+    () => isShiftFullyCompleted('Evening'),
+    [assignments, completedLogs, chambersList]
+  );
 
   const completedChambersCount = useMemo(() => {
     const todayStr = new Date().toISOString().split('T')[0];
@@ -543,7 +490,7 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
       const done = countLoggedClientsForChamber(chamber.id, activeShift, todayStr);
       return done >= target;
     }).length;
-  }, [chambersList, completedLogs, activeShift, chamberClientTargets]);
+  }, [chambersList, completedLogs, activeShift, assignments]);
 
   const getActiveTasksDetails = () => {
     const isEveningUnlocked = new Date().getHours() >= 16;
@@ -666,16 +613,16 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
 
     let unsubscribeSync = null;
     (async () => {
-    // Keep legacy purge flag so we don't wipe default masters again; defaults are re-seeded on empty chambers
+    // Force-clear demo clients so dashboard empty CTA shows (Expo Go SQLite cache)
     try {
-      await AsyncStorage.setItem('purged_auto_master_lots_v1', '1');
+      const purgedKey = 'purged_default_client_master_v3';
+      const already = await AsyncStorage.getItem(purgedKey);
+      const n = purgeAutoSeededMasterLotsOnce();
+      if (!already) await AsyncStorage.setItem(purgedKey, '1');
+      if (n > 0) console.log(`🧹 Cleared ${n} example client row(s) — DO will add chamber-wise.`);
     } catch (_) {}
     try {
-      const raw = await AsyncStorage.getItem('chamber_client_targets');
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed === 'object') setChamberClientTargets(parsed);
-      }
+      await AsyncStorage.removeItem('chamber_client_targets');
     } catch (_) {}
 
       unsubscribeSync = subscribeToSync(apiUrl, token, (status) => {
@@ -785,9 +732,11 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
   };
 
   /** Plus / More → open Chambers & Clients master (add/delete chambers within limit). */
-  const openMasterManager = () => {
-    setManagerSelectedChamber(null);
-    setMasterManagerTab('chambers');
+  const openMasterManager = (options = {}) => {
+    const preferredChamber = options.chamber || null;
+    const tab = options.tab === 'clients' || options.tab === 'chambers' ? options.tab : 'chambers';
+    setManagerSelectedChamber(preferredChamber);
+    setMasterManagerTab(tab);
     setShowManagerChamberDropdown(false);
     setShowClientSuggestions(false);
     setNewChamberNameInput('');
@@ -795,6 +744,16 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
     setEditingClientName(null);
     setEditClientDraft('');
     setShowClientManagerModal(true);
+  };
+
+  /** Open Master Setup → Clients tab for a chamber (dashboard empty-client CTA). */
+  const openMasterSetupAddClients = (chamber = null) => {
+    const target =
+      chamber ||
+      chambersList.find((c) => getClientsForChamber(c.id).length === 0) ||
+      chambersList[0] ||
+      null;
+    openMasterManager({ chamber: target, tab: 'clients' });
   };
 
   /** Master Setup opens directly — no Super Admin allow gate */
@@ -1042,11 +1001,6 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
       setAddChamberNameInput('');
       setAddChamberRemarkInput('');
       await refreshPermissionNotifications();
-      reportDOActivity(
-        'REQUEST_EDIT',
-        `${displayName} requested ADD chamber "${name}". Remark: ${remark}`,
-        remark
-      );
       Alert.alert(
         'Request sent to Super Admin',
         `Allow needed to add "${name}". After Super Admin approves, open notifications (bell) — chamber will assign automatically.`
@@ -1124,12 +1078,6 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
         }
         throw new Error(data.error || data.message || 'Failed to request delete permission.');
       }
-      reportDOActivity(
-        'REQUEST_DELETE',
-        `${displayName} requested delete chamber "${chamber.name}" (id: ${chamber.id}).` +
-          (resolvedRemark ? ` Remark: ${resolvedRemark}` : ''),
-        resolvedRemark
-      );
       Alert.alert(
         'Request sent to Super Admin',
         `Allow needed to delete "${chamber.name}". After Super Admin approves, open notifications (bell) or tap Delete again.`
@@ -1398,7 +1346,14 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
       const data = await response.json();
       
       if (data.success && Array.isArray(data.data)) {
-        cacheAssignments(data.data);
+        const demoNames = new Set(
+          DEFAULT_CLIENT_LOT_MASTER.map((n) => String(n).trim().toLowerCase())
+        );
+        const cleaned = data.data.filter(
+          (a) => !demoNames.has(String(a?.client_name || '').trim().toLowerCase())
+        );
+        cacheAssignments(cleaned);
+        purgeAutoSeededMasterLotsOnce();
       }
 
       // Load Chamber 1..N; create any missing so dashboard always has tasks
@@ -1427,43 +1382,8 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
       const rows = Array.isArray(chData?.data) ? chData.data : (Array.isArray(chData) ? chData : []);
       return rows.map((c) => ({
         id: Number(c.id),
-        name: c.name || c.chamber_name || `Chamber ${c.id}`,
-        total_clients:
-          c.total_clients != null && c.total_clients !== ''
-            ? parseInt(c.total_clients, 10)
-            : null
+        name: c.name || c.chamber_name || `Chamber ${c.id}`
       }));
-    };
-
-    const applyServerTotalClients = async (chambers) => {
-      if (!Array.isArray(chambers) || !chambers.length) return;
-      let merged = {};
-      try {
-        const raw = await AsyncStorage.getItem('chamber_client_targets');
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          if (parsed && typeof parsed === 'object') merged = { ...parsed };
-        }
-      } catch (_) {}
-      let changed = false;
-      chambers.forEach((c) => {
-        if (c.id == null) return;
-        const key = String(c.id);
-        if (c.total_clients != null && Number.isFinite(c.total_clients) && c.total_clients >= 1) {
-          if (Number(merged[key]) !== Number(c.total_clients)) {
-            merged[key] = c.total_clients;
-            changed = true;
-          }
-        }
-      });
-      if (changed || Object.keys(merged).length) {
-        setChamberClientTargets(merged);
-        if (changed) {
-          try {
-            await AsyncStorage.setItem('chamber_client_targets', JSON.stringify(merged));
-          } catch (_) {}
-        }
-      }
     };
 
     const fetchChambers = async () => {
@@ -1507,8 +1427,7 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
           if (res.ok && body?.data?.id) {
             chambers.push({
               id: Number(body.data.id),
-              name: body.data.name || `Chamber ${i}`,
-              total_clients: body.data.total_clients != null ? parseInt(body.data.total_clients, 10) : null
+              name: body.data.name || `Chamber ${i}`
             });
           }
         } catch (_) {}
@@ -1526,12 +1445,9 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
     if (!chambers.length && effectiveLimit > 0) {
       chambers = Array.from({ length: effectiveLimit }, (_, idx) => ({
         id: idx + 1,
-        name: `Chamber ${idx + 1}`,
-        total_clients: null
+        name: `Chamber ${idx + 1}`
       }));
     }
-
-    await applyServerTotalClients(chambers);
 
     return applyChamberLimit(chambers).slice(0, effectiveLimit);
   };
@@ -1565,16 +1481,8 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
       }));
     }
 
-    // Empty chambers get default client master; user can edit per chamber later
-    const seeded = seedDefaultClientsForEmptyChambers(chambers);
-    if (seeded > 0) {
-      cachedData = getLocalAssignments();
-      if (apiUrl && token) {
-        try {
-          triggerSync(apiUrl, token, setSyncStatus);
-        } catch (_) {}
-      }
-    }
+    // Empty chambers stay empty — DO adds clients chamber-wise in Master Setup
+    // (no auto-seed of example clients)
 
     const lots = getClientLotMaster();
     setMasterClientLots(lots);
@@ -1737,10 +1645,10 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
     setShowLogModal(true);
   };
 
-  // Calculate variance between current time and captured image time
-  const getImageTimeDifferenceInMinutes = () => {
-    if (!capturedImageTimestamp) return 0;
-    const diffMs = Math.abs(Date.now() - capturedImageTimestamp);
+  // Variance (minutes) between photo capture time and submit/now time
+  const getImageTimeDifferenceInMinutes = (submitTs = Date.now()) => {
+    if (!capturedImageTimestamp) return null;
+    const diffMs = Math.abs(submitTs - capturedImageTimestamp);
     return Math.floor(diffMs / (1000 * 60));
   };
 
@@ -1756,6 +1664,16 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
     const min = String(dateObj.getMinutes()).padStart(2, '0');
     const ss = String(dateObj.getSeconds()).padStart(2, '0');
     return `${yyyy}-${mm}-${dd} ${hh}:${min}:${ss}`;
+  };
+
+  const formatClockTime = (timestamp) => {
+    if (!timestamp) return '-';
+    const dateObj = new Date(timestamp);
+    if (isNaN(dateObj.getTime())) return '-';
+    const hh = String(dateObj.getHours()).padStart(2, '0');
+    const min = String(dateObj.getMinutes()).padStart(2, '0');
+    const ss = String(dateObj.getSeconds()).padStart(2, '0');
+    return `${hh}:${min}:${ss}`;
   };
 
   const handleTempInputChange = (text) => {
@@ -1783,10 +1701,20 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
       Alert.alert('Validation Error', 'Please select a Client.');
       return;
     }
-    if (!editingExistingLog && getChamberClientTarget(selectedChamber.id) == null) {
+    if (!editingExistingLog && getClientsForChamber(selectedChamber.id).length === 0) {
       Alert.alert(
-        'Total Clients required',
-        'Type Total Clients (1, 2, 3, or 4) first. Chamber completes after that many client submits.'
+        'Add clients first',
+        'Is chamber pe Master Setup me client add karo — phir task submit hoga.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          {
+            text: 'Open Master Setup',
+            onPress: () => {
+              setShowLogModal(false);
+              openMasterSetupAddClients(selectedChamber);
+            }
+          }
+        ]
       );
       return;
     }
@@ -1805,6 +1733,16 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
     }
     if (!capturedImage) {
       Alert.alert('Validation Error', 'Please capture a photo of the sensor/box.');
+      return;
+    }
+    // Edit + new: photo capture time must exist so it can be compared with submit time
+    if (!capturedImageTimestamp) {
+      Alert.alert(
+        'Retake Photo Required',
+        editingExistingLog
+          ? 'Edit submit pe image time ko submit time se compare kiya jata hai. Naya verification photo lo.'
+          : 'Photo capture time missing. Please retake the verification photo.'
+      );
       return;
     }
 
@@ -1859,25 +1797,27 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
 
     const todayStr = new Date().toISOString().split('T')[0];
     const targetDate = selectedTaskDueDate || todayStr;
-    const captureTimeStr = formatDateTime(capturedImageTimestamp || Date.now());
+    const submitNowMs = Date.now();
+    // Always use real photo capture time (never fake as submit) — compared with submitNowMs
+    const captureTimeStr = formatDateTime(capturedImageTimestamp);
+    const photoVsSubmitMins = getImageTimeDifferenceInMinutes(submitNowMs);
 
     // Approved edit of an existing completed log
     if (editingExistingLog) {
-      const serverLogId = getServerLogIdForPermission(editingExistingLog);
-      const nowTs = formatDateTime(new Date());
-      const normalizedUpdateTime = (() => {
-        const raw = String(updateTimeInput || '').trim();
-        const m = raw.match(/^(\d{1,2}):(\d{2})$/);
-        if (!m) return null;
-        const h = Math.min(23, Math.max(0, parseInt(m[1], 10)));
-        const min = Math.min(59, Math.max(0, parseInt(m[2], 10)));
-        return `${String(h).padStart(2, '0')}:${String(min).padStart(2, '0')}`;
-      })();
-
-      if (!normalizedUpdateTime) {
-        Alert.alert('Invalid Time', 'Enter update time as HH:mm (e.g. 14:35).');
+      if (!captureTimeStr) {
+        Alert.alert(
+          'Retake Photo Required',
+          'Edit pe image capture time submit time se compare hota hai. Naya photo lo phir update karo.'
+        );
         return;
       }
+
+      const serverLogId = getServerLogIdForPermission(editingExistingLog);
+      const nowTs = formatDateTime(submitNowMs);
+      // Keep original inspection time — Update Time / client name are not editable on edit
+      const keepInspectionTime =
+        editingExistingLog.inspection_time ||
+        (editingExistingLog.shift === 'Evening' ? '16:00' : '10:00');
 
       const localOk = updateInspectionLocally(editingExistingLog.id, {
         box_temp: parseFloat(tempInput),
@@ -1885,7 +1825,8 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
         temp_sensor_image: capturedImage,
         photo_capture_time: captureTimeStr,
         chamber_type: selectedChamberType,
-        inspection_time: normalizedUpdateTime,
+        inspection_time: keepInspectionTime,
+        client_name: editingExistingLog.client_name || selectedClient,
         updated_at: nowTs,
         sync_status: 'synced'
       });
@@ -1901,9 +1842,13 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
           formData.append('box_temp', String(parseFloat(tempInput)));
           formData.append('box_count', String(parseInt(boxCountInput, 10)));
           formData.append('chamber_type', selectedChamberType || 'Frozen');
-          formData.append('inspection_time', normalizedUpdateTime);
+          formData.append('inspection_time', keepInspectionTime);
+          formData.append('photo_capture_time', captureTimeStr);
           formData.append('monitor_supervisor_name', displayName);
-          formData.append('remarks', 'Mobile native edit after Super Admin permission approval');
+          formData.append(
+            'remarks',
+            `Mobile edit after SA allow. Photo vs submit: ${photoVsSubmitMins ?? '?'} min`
+          );
           if (capturedImage && !String(capturedImage).startsWith('http') && !String(capturedImage).startsWith('uploads/')) {
             const filename = String(capturedImage).split('/').pop() || `edit-${serverLogId}.jpg`;
             formData.append('temp_sensor_image', {
@@ -1941,7 +1886,7 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
         );
         reportDOActivity(
           'UPDATE',
-          `Mobile: updated Chamber log ${refLabel} at ${normalizedUpdateTime}`
+          `Mobile: updated Chamber log ${refLabel}`
         );
       } catch (err) {
         Alert.alert('Cloud Update Failed', err.message || 'Local copy was updated; cloud sync failed.');
@@ -2032,11 +1977,9 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
 
       Alert.alert(
         'Inspection Saved',
-        target == null
-          ? `Saved "${selectedClient}". Set Total Clients (1–4) so chamber can complete.`
-          : chamberFullyDone
-            ? `All ${totalClients} client(s) logged for ${selectedChamber.name}. Chamber completed.`
-            : `Saved "${selectedClient}". ${doneAfter}/${totalClients} done — ${remaining} more needed.`,
+        chamberFullyDone
+          ? `All ${totalClients} client(s) logged for ${selectedChamber.name}. Chamber completed.`
+          : `Saved "${selectedClient}". ${doneAfter}/${totalClients || '?'} done — ${remaining} more needed.`,
         [
           { text: 'OK' },
           ...(!chamberFullyDone && target != null && remaining > 0 && currentNavTab === 'Tasks'
@@ -2545,14 +2488,8 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
     setBoxCountInput(existingLog.box_count ? String(existingLog.box_count) : '');
     setCapturedImage(existingLog.temp_sensor_image);
     setSelectedChamberType(existingLog.chamber_type || getChamberTypeAndDefault(item.chamber_id).type);
-
-    // Prefill update time with current clock (editable); fallback to existing log time
-    const now = new Date();
-    const nowHhMm = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-    const existingTime = String(existingLog.inspection_time || '').trim();
-    const looksLikeHhMm = /^\d{1,2}:\d{2}$/.test(existingTime);
-    setUpdateTimeInput(nowHhMm || (looksLikeHhMm ? existingTime : ''));
-
+    setUpdateTimeInput('');
+    setShowClientDropdown(false);
     if (existingLog.photo_capture_time) {
       try {
         const parsedDate = new Date(String(existingLog.photo_capture_time).replace(' ', 'T'));
@@ -2699,10 +2636,6 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
         'Request Sent',
         'Edit permission request sent to Super Admin. When approved, a message will appear on the notification bell.'
       );
-      reportDOActivity(
-        'REQUEST_EDIT',
-        `Mobile: requested edit permission for Chamber log ${log.reference_no || serverLogId}`
-      );
     } catch (err) {
       Alert.alert('Request Failed', err.message || 'Could not send permission request.');
     } finally {
@@ -2713,6 +2646,19 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
   const handleOpenChamberLogFormDirect = (chamber) => {
     if (!chamber) return;
 
+    const masterClients = getClientsForChamber(chamber.id);
+    if (masterClients.length === 0) {
+      Alert.alert(
+        'Add clients first',
+        `"${chamber.name}" pe abhi koi client nahi. Master Setup me add karo.`,
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Open Master Setup', onPress: () => openMasterSetupAddClients(chamber) }
+        ]
+      );
+      return;
+    }
+
     const todayStr = new Date().toISOString().split('T')[0];
     const target = getChamberClientTarget(chamber.id);
     const done = countLoggedClientsForChamber(chamber.id, activeShift, todayStr);
@@ -2721,15 +2667,12 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
       return;
     }
     
-    const chamberClients = assignments.filter(item => Number(item.chamber_id) === Number(chamber.id) && item.status !== 'inactive');
     const unloggedClient =
-      chamberClients.find(item => !isClientCompletedToday(chamber.id, item.client_name)) ||
-      chamberClients[0] ||
-      { client_name: masterClientLots[0] || 'General' };
+      masterClients.find(item => !isClientCompletedToday(chamber.id, item.client_name)) ||
+      masterClients[0];
     
     setSelectedChamber(chamber);
     setSelectedClient(unloggedClient.client_name);
-    setTotalClientsDraft(target != null ? String(target) : '');
     setTempInput('');
     setBoxCountInput('');
     setCapturedImage(null);
@@ -2844,9 +2787,13 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
                 <TouchableOpacity
                   style={{
                     flex: 1,
-                    backgroundColor: activeShift === 'Morning' ? '#fffbeb' : (isMorningCompleted ? '#f8fafc' : '#ffffff'),
-                    borderColor: activeShift === 'Morning' ? '#eab308' : '#e2e8f0',
-                    borderWidth: activeShift === 'Morning' ? 1.5 : 1,
+                    backgroundColor: isMorningCompleted
+                      ? '#f0fdf4'
+                      : '#fffbeb',
+                    borderColor: isMorningCompleted
+                      ? '#86efac'
+                      : '#eab308',
+                    borderWidth: activeShift === 'Morning' || isMorningCompleted ? 1.5 : 1,
                     borderRadius: 8,
                     padding: 8,
                     alignItems: 'center',
@@ -2857,32 +2804,50 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
                     shadowOffset: { width: 0, height: 1 },
                     shadowOpacity: 0.05,
                     shadowRadius: 2,
-                    opacity: isMorningCompleted ? 0.6 : 1,
                   }}
-                  disabled={isMorningCompleted}
                   activeOpacity={0.8}
                   onPress={() => handleSelectShift('Morning')}
                 >
-                  <View style={{ width: 26, height: 26, borderRadius: 13, backgroundColor: activeShift === 'Morning' ? '#eab308' : '#f1f5f9', alignItems: 'center', justifyContent: 'center', marginRight: 6 }}>
-                    <Ionicons name="sunny" size={13} color={activeShift === 'Morning' ? '#ffffff' : '#475569'} />
+                  <View style={{
+                    width: 26,
+                    height: 26,
+                    borderRadius: 13,
+                    backgroundColor: isMorningCompleted
+                      ? '#16a34a'
+                      : '#eab308',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    marginRight: 6
+                  }}>
+                    <Ionicons
+                      name={isMorningCompleted ? 'checkmark' : 'sunny'}
+                      size={13}
+                      color={isMorningCompleted ? '#ffffff' : '#ffffff'}
+                    />
                   </View>
                   <View style={{ flex: 1 }}>
                     <Text style={{ 
                       fontSize: 11.5, 
                       fontWeight: showMorningRed ? '900' : '800', 
-                      color: showMorningRed ? '#ef4444' : (activeShift === 'Morning' ? '#ca8a04' : '#334155') 
+                      color: isMorningCompleted
+                        ? '#15803d'
+                        : (showMorningRed ? '#ef4444' : '#ca8a04')
                     }}>
                       Morning Task
                     </Text>
-                    <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 0.5 }}>
-                      {isMorningCompleted && (
-                        <Ionicons name="checkmark-circle" size={11} color="#16a34a" style={{ marginRight: 3 }} />
-                      )}
-                      <Text style={{ fontSize: 8.5, color: isMorningCompleted ? '#16a34a' : '#64748b', fontWeight: '600' }}>
-                        {isMorningCompleted ? 'Completed' : 'Morning Slot'}
-                      </Text>
-                    </View>
+                    <Text style={{
+                      fontSize: 8.5,
+                      color: isMorningCompleted ? '#16a34a' : '#ca8a04',
+                      fontWeight: '700',
+                      marginTop: 0.5,
+                      opacity: isMorningCompleted ? 1 : 0.85
+                    }}>
+                      {isMorningCompleted ? 'Completed' : 'Morning Slot'}
+                    </Text>
                   </View>
+                  {isMorningCompleted ? (
+                    <Ionicons name="checkmark-circle" size={22} color="#16a34a" />
+                  ) : null}
                 </TouchableOpacity>
               );
             })()}
@@ -2890,54 +2855,79 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
             {/* Evening Shift Card */}
             {(() => {
               const isEveningUnlocked = new Date().getHours() >= 16;
-              const showEveningRed = activeShift !== 'Evening' && isEveningUnlocked && !eveningClicked;
+              const showEveningRed = activeShift !== 'Evening' && isEveningUnlocked && !eveningClicked && !isEveningCompleted;
               return (
                 <TouchableOpacity
                   style={{
                     flex: 1,
-                    backgroundColor: activeShift === 'Evening' ? '#eff6ff' : (isEveningUnlocked ? '#ffffff' : '#f8fafc'),
-                    borderColor: activeShift === 'Evening' ? '#2563eb' : '#e2e8f0',
-                    borderWidth: activeShift === 'Evening' ? 1.5 : 1,
+                    backgroundColor: isEveningCompleted
+                      ? '#f0fdf4'
+                      : (activeShift === 'Evening' ? '#eff6ff' : (isEveningUnlocked ? '#ffffff' : '#f8fafc')),
+                    borderColor: isEveningCompleted
+                      ? '#86efac'
+                      : (activeShift === 'Evening' ? '#2563eb' : '#e2e8f0'),
+                    borderWidth: activeShift === 'Evening' || isEveningCompleted ? 1.5 : 1,
                     borderRadius: 8,
                     padding: 8,
                     alignItems: 'center',
                     flexDirection: 'row',
                     marginLeft: 4,
-                    opacity: isEveningUnlocked ? 1 : 0.7,
+                    opacity: isEveningUnlocked || isEveningCompleted ? 1 : 0.7,
                     elevation: 1,
                     shadowColor: '#000',
                     shadowOffset: { width: 0, height: 1 },
                     shadowOpacity: 0.05,
                     shadowRadius: 2,
                   }}
-                  disabled={!isEveningUnlocked}
+                  disabled={!isEveningUnlocked && !isEveningCompleted}
                   activeOpacity={0.8}
                   onPress={() => handleSelectShift('Evening')}
                 >
-                  <View style={{ width: 26, height: 26, borderRadius: 13, backgroundColor: activeShift === 'Evening' ? '#2563eb' : '#f1f5f9', alignItems: 'center', justifyContent: 'center', marginRight: 6 }}>
+                  <View style={{
+                    width: 26,
+                    height: 26,
+                    borderRadius: 13,
+                    backgroundColor: isEveningCompleted
+                      ? '#16a34a'
+                      : (activeShift === 'Evening' ? '#2563eb' : '#f1f5f9'),
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    marginRight: 6
+                  }}>
                     <Ionicons 
-                      name={isEveningUnlocked ? "moon" : "lock-closed"} 
+                      name={
+                        isEveningCompleted
+                          ? 'checkmark'
+                          : (isEveningUnlocked ? 'moon' : 'lock-closed')
+                      }
                       size={13} 
-                      color={activeShift === 'Evening' ? '#ffffff' : '#475569'} 
+                      color={isEveningCompleted || activeShift === 'Evening' ? '#ffffff' : '#475569'} 
                     />
                   </View>
                   <View style={{ flex: 1 }}>
                     <Text style={{ 
                       fontSize: 11.5, 
                       fontWeight: showEveningRed ? '900' : '800', 
-                      color: showEveningRed ? '#ef4444' : (activeShift === 'Evening' ? '#1e3a8a' : '#334155') 
+                      color: isEveningCompleted
+                        ? '#15803d'
+                        : (showEveningRed ? '#ef4444' : (activeShift === 'Evening' ? '#1e3a8a' : '#334155'))
                     }}>
                       Evening Task
                     </Text>
-                    <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 0.5 }}>
-                      {isEveningCompleted && (
-                        <Ionicons name="checkmark-circle" size={11} color="#16a34a" style={{ marginRight: 3 }} />
-                      )}
-                      <Text style={{ fontSize: 8.5, color: isEveningCompleted ? '#16a34a' : '#64748b', fontWeight: '600' }}>
-                        {isEveningCompleted ? 'Completed' : (isEveningUnlocked ? 'Evening Slot' : 'Locks until evening')}
-                      </Text>
-                    </View>
+                    <Text style={{
+                      fontSize: 8.5,
+                      color: isEveningCompleted ? '#16a34a' : '#64748b',
+                      fontWeight: '700',
+                      marginTop: 0.5
+                    }}>
+                      {isEveningCompleted
+                        ? 'Completed'
+                        : (isEveningUnlocked ? 'Evening Slot' : 'Locks until evening')}
+                    </Text>
                   </View>
+                  {isEveningCompleted ? (
+                    <Ionicons name="checkmark-circle" size={22} color="#16a34a" />
+                  ) : null}
                 </TouchableOpacity>
               );
             })()}
@@ -3043,6 +3033,36 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
           </TouchableOpacity>
         </View>
 
+        {(() => {
+          const emptyClientChambers = chambersList.filter(
+            (c) => getClientsForChamber(c.id).length === 0
+          );
+          if (chambersList.length === 0 || emptyClientChambers.length === 0) return null;
+          const allEmpty = emptyClientChambers.length === chambersList.length;
+          return (
+            <TouchableOpacity
+              style={styles.setupClientsBanner}
+              onPress={() => openMasterSetupAddClients(emptyClientChambers[0])}
+              activeOpacity={0.88}
+            >
+              <View style={styles.setupClientsBannerIcon}>
+                <Ionicons name="people-outline" size={20} color="#0369a1" />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.setupClientsBannerTitle}>
+                  {allEmpty ? 'Add clients to start tasks' : 'Some chambers need clients'}
+                </Text>
+                <Text style={styles.setupClientsBannerSub}>
+                  {allEmpty
+                    ? 'Chamber-wise client master empty hai. Master Setup → Clients me add karo.'
+                    : `${emptyClientChambers.length} chamber(s) me 0 clients — tap to add.`}
+                </Text>
+              </View>
+              <Text style={styles.setupClientsBannerCta}>Add ➔</Text>
+            </TouchableOpacity>
+          );
+        })()}
+
         <View style={styles.chambersGrid}>
           {getFilteredChambers().length === 0 ? (
             <View style={styles.emptyGridPlaceholder}>
@@ -3056,15 +3076,24 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
               const target = getChamberClientTarget(chamber.id);
               const doneCount = countLoggedClientsForChamber(chamber.id, activeShift, todayStr);
               const isDone = target != null && doneCount >= target;
+              const clientCount = getClientsForChamber(chamber.id).length;
+              const needsClients = clientCount === 0;
 
               return (
                 <TouchableOpacity
                   key={chamber.id}
                   style={[
                     styles.chamberCard, 
-                    details.hasAlert && styles.chamberCardAlertBorder
+                    details.hasAlert && styles.chamberCardAlertBorder,
+                    needsClients && styles.chamberCardNeedsClients
                   ]}
-                  onPress={() => handleOpenChamberLogFormDirect(chamber)}
+                  onPress={() => {
+                    if (needsClients) {
+                      openMasterSetupAddClients(chamber);
+                      return;
+                    }
+                    handleOpenChamberLogFormDirect(chamber);
+                  }}
                 >
                   {/* Left: Chamber details */}
                   <View style={{ flex: 1, alignItems: 'flex-start' }}>
@@ -3075,16 +3104,30 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
                     <View style={[styles.typePill, { backgroundColor: details.pillBg, marginVertical: 0 }]}>
                       <Text style={[styles.typePillText, { color: details.pillColor }]}>{details.type}</Text>
                     </View>
+                    <Text style={{
+                      fontSize: 10,
+                      fontWeight: '700',
+                      color: needsClients ? '#0369a1' : '#64748b',
+                      marginTop: 6
+                    }}>
+                      {needsClients ? '0 clients · Tap to add' : `${clientCount} client${clientCount === 1 ? '' : 's'}`}
+                    </Text>
                   </View>
 
                   {/* Right: Status */}
                   <View style={{ alignItems: 'flex-end', justifyContent: 'center' }}>
-                    <View style={[styles.statusIndicatorRow, { marginTop: 0 }]}>
-                      <View style={[styles.statusDot, { backgroundColor: isDone ? '#16a34a' : details.statusColor }]} />
-                      <Text style={[styles.statusText, { color: isDone ? '#16a34a' : details.statusColor, fontSize: 11 }]}>
-                        {isDone ? 'Done' : 'Pending'}
-                      </Text>
-                    </View>
+                    {needsClients ? (
+                      <View style={styles.addClientChip}>
+                        <Text style={styles.addClientChipText}>Add</Text>
+                      </View>
+                    ) : (
+                      <View style={[styles.statusIndicatorRow, { marginTop: 0 }]}>
+                        <View style={[styles.statusDot, { backgroundColor: isDone ? '#16a34a' : details.statusColor }]} />
+                        <Text style={[styles.statusText, { color: isDone ? '#16a34a' : details.statusColor, fontSize: 11 }]}>
+                          {isDone ? 'Done' : 'Pending'}
+                        </Text>
+                      </View>
+                    )}
                   </View>
                 </TouchableOpacity>
               );
@@ -3177,19 +3220,19 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
                 ? 'Done'
                 : (item.is_overdue ? 'Overdue' : 'Pending');
 
+              const shiftLabel =
+                item.shift_label || (item.shift_time === '10:00' ? 'Morning' : 'Evening');
+              const isEveningShift =
+                item.shift_time === '16:00' || /evening/i.test(String(shiftLabel));
+              const shiftColor = isEveningShift ? '#2563eb' : '#ca8a04'; // Evening blue · Morning yellow (dashboard match)
+
               const titleText = isChamberRow
                 ? (item.chamber_name || `Chamber ${item.chamber_id}`)
                 : (item.client_name || 'Client');
 
-              const metaText = isChamberRow
-                ? [
-                    item.shift_label || (item.shift_time === '10:00' ? 'Morning' : 'Evening'),
-                    item.is_overdue && item.due_date ? `Due ${item.due_date}` : null
-                  ].filter(Boolean).join('  ·  ')
-                : [
-                    item.chamber_name,
-                    item.shift_label || (item.shift_time === '10:00' ? 'Morning' : 'Evening')
-                  ].filter(Boolean).join('  ·  ');
+              const prefixMeta = isChamberRow
+                ? (item.is_overdue && item.due_date ? `Due ${item.due_date}` : null)
+                : (item.chamber_name || null);
 
               return (
                 <View
@@ -3241,7 +3284,8 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
                       </Text>
 
                       <Text style={styles.taskMetaLine} numberOfLines={1}>
-                        {metaText}
+                        {prefixMeta ? `${prefixMeta}  ·  ` : ''}
+                        <Text style={{ color: shiftColor, fontWeight: '800' }}>{shiftLabel}</Text>
                       </Text>
 
                       {isChamberRow && item.target_set ? (
@@ -3308,12 +3352,31 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
                           style={styles.logActionBtn}
                           onPress={() => {
                             if (isChamberRow) {
-                              const chamber =
-                                chambersList.find((c) => Number(c.id) === Number(item.chamber_id)) || {
-                                  id: item.chamber_id,
-                                  name: item.chamber_name
-                                };
-                              handleOpenChamberLogFormDirect(chamber);
+                              const targetDate = item.due_date || new Date().toISOString().split('T')[0];
+                              const shiftName = item.shift_time === '16:00' ? 'Evening' : 'Morning';
+                              const chamberLog = completedLogs.find(
+                                (l) =>
+                                  Number(l.chamber_id) === Number(item.chamber_id) &&
+                                  l.entry_date === targetDate &&
+                                  (l.shift === shiftName ||
+                                    (!l.shift &&
+                                      ((shiftName === 'Evening' && l.inspection_time === '16:00') ||
+                                        (shiftName === 'Morning' && (l.inspection_time === '10:00' || !l.inspection_time)))))
+                              );
+                              if (!chamberLog) {
+                                Alert.alert('Edit', 'Is chamber ke liye abhi koi completed client log nahi mila.');
+                                return;
+                              }
+                              if (item.shift_time === '16:00') handleSelectShift('Evening');
+                              else handleSelectShift('Morning');
+                              handleEditCompletedLog({
+                                ...item,
+                                chamber_id: chamberLog.chamber_id,
+                                chamber_name: chamberLog.chamber_name || item.chamber_name,
+                                client_name: chamberLog.client_name,
+                                shift_time: item.shift_time || (shiftName === 'Evening' ? '16:00' : '10:00'),
+                                shift_label: item.shift_label || `${shiftName} Task`
+                              });
                             } else {
                               handleEditCompletedLog(item);
                             }
@@ -3321,7 +3384,7 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
                           activeOpacity={0.85}
                         >
                           <Ionicons name="create-outline" size={14} color="#ffffff" style={{ marginRight: 4 }} />
-                          <Text style={styles.logActionBtnText}>{isChamberRow ? 'Open' : 'Edit'}</Text>
+                          <Text style={styles.logActionBtnText}>Edit</Text>
                         </TouchableOpacity>
                       )}
                     </View>
@@ -4309,10 +4372,10 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
                   borderRadius: 10,
                   borderWidth: 1,
                   borderColor: active
-                    ? (opt.value === 'Evening' ? '#b45309' : '#0369a1')
+                    ? (opt.value === 'Morning' ? '#eab308' : opt.value === 'Evening' ? '#2563eb' : '#0369a1')
                     : '#e2e8f0',
                   backgroundColor: active
-                    ? (opt.value === 'Evening' ? '#fef3c7' : '#e0f2fe')
+                    ? (opt.value === 'Morning' ? '#fef9c3' : opt.value === 'Evening' ? '#eff6ff' : '#e0f2fe')
                     : '#ffffff',
                   alignItems: 'center'
                 }}
@@ -4321,7 +4384,7 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
                   fontSize: 12,
                   fontWeight: '700',
                   color: active
-                    ? (opt.value === 'Evening' ? '#b45309' : '#0369a1')
+                    ? (opt.value === 'Morning' ? '#ca8a04' : opt.value === 'Evening' ? '#2563eb' : '#0369a1')
                     : '#64748b'
                 }}>
                   {opt.label}
@@ -4626,8 +4689,6 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
                                 setShowChamberDropdown(false);
                                 setSelectedClient(null);
                                 setSelectedChamberType(getChamberTypeAndDefault(ch.id).type);
-                                const t = getChamberClientTarget(ch.id);
-                                setTotalClientsDraft(t != null ? String(t) : '');
                               }}
                             >
                               <Text style={styles.dropdownItemText}>{ch.name}</Text>
@@ -4704,80 +4765,28 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
                 <View style={{ marginBottom: 12 }}>
                   <Text style={styles.modalLabel}>Task Time (Task Slot)</Text>
                   <View style={styles.readOnlyField}>
-                    <Text style={styles.readOnlyText}>
+                    <Text style={[
+                      styles.readOnlyText,
+                      {
+                        fontWeight: '800',
+                        color: selectedShift === '10:00' ? '#ca8a04' : '#2563eb'
+                      }
+                    ]}>
                       {selectedShift === '10:00' ? 'Morning Task' : 'Evening Task'}
                     </Text>
                   </View>
                 </View>
 
-                {/* Update Time — only on approved edit form */}
-                {editingExistingLog && isProfileEditable && (
-                  <View style={{ marginBottom: 12 }}>
-                    <Text style={styles.modalLabel}>Update Time (HH:mm)</Text>
-                    <View style={styles.inputWrapper}>
-                      <Ionicons name="time-outline" size={16} color="#64748b" style={styles.inputIcon} />
-                      <TextInput
-                        style={styles.input}
-                        placeholder="e.g. 14:35"
-                        placeholderTextColor="#94a3b8"
-                        keyboardType="numbers-and-punctuation"
-                        value={updateTimeInput}
-                        onChangeText={setUpdateTimeInput}
-                        maxLength={5}
-                      />
-                    </View>
-                    <Text style={{ fontSize: 9, color: '#475569', marginTop: 4, marginLeft: 2, fontWeight: '600' }}>
-                      Format HH:mm — saved with this update
-                    </Text>
-                  </View>
-                )}
-
-                {/* Total Clients — above Client Lot Name, same input as Box Qty */}
-                <View style={{ marginBottom: 12 }}>
-                  <Text style={styles.modalLabel}>Total Clients</Text>
-                  {isProfileEditable ? (
-                    <>
-                      <View style={styles.inputWrapper}>
-                        <Ionicons name="people-outline" size={16} color="#64748b" style={styles.inputIcon} />
-                        <TextInput
-                          style={styles.input}
-                          placeholder="e.g. 3"
-                          placeholderTextColor="#94a3b8"
-                          keyboardType="numeric"
-                          maxLength={2}
-                          value={totalClientsDraft}
-                          onChangeText={(text) => {
-                            const cleaned = String(text || '').replace(/[^\d]/g, '');
-                            setTotalClientsDraft(cleaned);
-                            if (selectedChamber) {
-                              saveChamberClientTarget(selectedChamber.id, cleaned);
-                            }
-                          }}
-                          editable={!!selectedChamber}
-                        />
-                      </View>
-                      <Text style={{ fontSize: 9, color: '#475569', marginTop: 4, marginLeft: 2, fontWeight: '600' }}>
-                        Type 1, 2, 3 or 4 — chamber completes after this many client submits
-                        {selectedChamber && getChamberClientTarget(selectedChamber.id) != null
-                          ? ` (${countLoggedClientsForChamber(
-                              selectedChamber.id,
-                              selectedShift === '16:00' ? 'Evening' : 'Morning',
-                              new Date().toISOString().split('T')[0]
-                            )}/${getChamberClientTarget(selectedChamber.id)} done)`
-                          : ''}
-                      </Text>
-                    </>
-                  ) : (
-                    <View style={styles.readOnlyField}>
-                      <Text style={styles.readOnlyText}>{totalClientsDraft || '0'} clients</Text>
-                    </View>
-                  )}
-                </View>
-
-                {/* Client Lot Name */}
+                {/* Client Lot Name — locked on edit (cannot change client) */}
                 <View style={{ marginBottom: 12, zIndex: 10 }}>
                     <Text style={styles.modalLabel}>Client Lot Name</Text>
-                    {isProfileEditable ? (
+                    {editingExistingLog ? (
+                      <View style={styles.readOnlyField}>
+                        <Text style={styles.readOnlyText} numberOfLines={1}>
+                          {selectedClient || editingExistingLog.client_name || '-'}
+                        </Text>
+                      </View>
+                    ) : isProfileEditable ? (
                       <>
                         <TouchableOpacity 
                           style={[styles.dropdownTrigger, !selectedChamber && styles.dropdownDisabled, { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 10 }]} 
@@ -5032,14 +5041,6 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
                             <Text style={{ color: '#ffffff', fontSize: 12, fontWeight: 'bold' }}>Retake Photo</Text>
                           </TouchableOpacity>
                         </View>
-                        {capturedImageTimestamp && Math.abs(Date.now() - capturedImageTimestamp) > 5 * 60 * 1000 && (
-                          <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 8, alignSelf: 'center', paddingHorizontal: 10 }}>
-                            <Ionicons name="warning" size={14} color="#ef4444" style={{ marginRight: 4 }} />
-                            <Text style={{ color: '#ef4444', fontSize: 11, fontWeight: 'bold' }}>
-                              Warning: Photo captured {Math.floor(Math.abs(Date.now() - capturedImageTimestamp) / (1000 * 60))} mins ago (exceeds 5 mins)!
-                            </Text>
-                          </View>
-                        )}
                       </View>
                     ) : (
                       <TouchableOpacity 
@@ -5093,7 +5094,13 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
 
               {/* Bottom Actions */}
               {isProfileEditable ? (
-                <TouchableOpacity style={styles.submitBtn} onPress={handleSaveInspection}>
+                <TouchableOpacity
+                  style={[
+                    styles.submitBtn,
+                    editingExistingLog && { backgroundColor: '#ea580c' }
+                  ]}
+                  onPress={handleSaveInspection}
+                >
                   <Text style={styles.submitBtnText}>
                     {editingExistingLog ? 'Update Reading' : 'Submit Reading (Save Locally)'}
                   </Text>
@@ -5309,8 +5316,7 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
                       Client master · {managerSelectedChamber.name}
                     </Text>
                     <Text style={styles.mmCardHint}>
-                      Default client master is pre-filled on every chamber. Customize per chamber
-                      (add / edit / delete) — Super Admin is notified on edit and delete.
+                      Chamber empty hai to yahan client add karo. Add / edit / delete pe Super Admin notify hota hai (allow nahi).
                     </Text>
                     <View style={styles.mmAddRow}>
                       <TextInput
@@ -5692,12 +5698,15 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
     );
   };
 
-  // Submission Confirmation Dialog with Photo Timestamp Alert
+  // Submission Confirmation Dialog — photo capture time vs submit time (new + edit)
   const renderSubmitConfirmModal = () => {
     if (!showSubmitConfirmModal) return null;
 
-    const diffMins = getImageTimeDifferenceInMinutes();
-    const isVarianceAlert = diffMins > 5;
+    const submitNowMs = Date.now();
+    const diffMins = getImageTimeDifferenceInMinutes(submitNowMs);
+    const isVarianceAlert = diffMins == null || diffMins > 5;
+    const photoClock = formatClockTime(capturedImageTimestamp);
+    const submitClock = formatClockTime(submitNowMs);
 
     return (
       <Modal visible={showSubmitConfirmModal} animationType="fade" transparent>
@@ -5719,23 +5728,60 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
                   color={isVarianceAlert ? "#ef4444" : "#16a34a"} 
                 />
               </View>
-              <Text style={[styles.dialogTitle, { textAlign: 'center' }]}>Confirm Submission</Text>
+              <Text style={[styles.dialogTitle, { textAlign: 'center' }]}>
+                {editingExistingLog ? 'Confirm Edit Update' : 'Confirm Submission'}
+              </Text>
+            </View>
+
+            <View style={{
+              backgroundColor: '#f8fafc',
+              borderRadius: 10,
+              borderWidth: 1,
+              borderColor: '#e2e8f0',
+              paddingVertical: 10,
+              paddingHorizontal: 12,
+              marginBottom: 14
+            }}>
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 6 }}>
+                <Text style={{ fontSize: 11, color: '#64748b', fontWeight: '600' }}>Photo capture</Text>
+                <Text style={{ fontSize: 12, color: '#0f172a', fontWeight: '800' }}>{photoClock}</Text>
+              </View>
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 6 }}>
+                <Text style={{ fontSize: 11, color: '#64748b', fontWeight: '600' }}>Submit time</Text>
+                <Text style={{ fontSize: 12, color: '#0f172a', fontWeight: '800' }}>{submitClock}</Text>
+              </View>
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
+                <Text style={{ fontSize: 11, color: '#64748b', fontWeight: '600' }}>Difference</Text>
+                <Text style={{
+                  fontSize: 12,
+                  fontWeight: '800',
+                  color: isVarianceAlert ? '#dc2626' : '#16a34a'
+                }}>
+                  {diffMins == null ? 'N/A' : `${diffMins} min`}
+                </Text>
+              </View>
             </View>
 
             <Text style={[styles.dialogSubtitle, { textAlign: 'center', marginBottom: 20 }]}>
-              {isVarianceAlert ? (
+              {diffMins == null ? (
                 <Text style={{ color: '#ef4444', fontWeight: 'bold' }}>
-                  ⚠️ Warning: The verification photo was captured {diffMins} minutes ago, which exceeds the allowed 5-minute compliance limit.
+                  Photo capture time missing. Retake verification photo, then submit.
+                </Text>
+              ) : isVarianceAlert ? (
+                <Text style={{ color: '#ef4444', fontWeight: 'bold' }}>
+                  Warning: Photo was captured {diffMins} minutes before submit (limit 5 minutes).
                 </Text>
               ) : (
                 <Text style={{ color: '#16a34a', fontWeight: 'bold' }}>
-                  ✓ Verification photo capture time is compliant (captured {diffMins} minutes ago).
+                  Photo time vs submit is compliant ({diffMins} min).
                 </Text>
               )}
             </Text>
 
             <Text style={{ fontSize: 12, color: '#64748b', textAlign: 'center', marginBottom: 20 }}>
-              Do you want to continue and submit this inspection record?
+              {editingExistingLog
+                ? 'Continue to update this inspection record?'
+                : 'Do you want to continue and submit this inspection record?'}
             </Text>
 
             <View style={styles.dialogActionsRow}>
@@ -6185,16 +6231,6 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
               autoCapitalize="words"
             />
 
-            <Text style={[styles.modalLabel, { fontSize: 11, marginBottom: 4 }]}>Add Remark / Reason</Text>
-            <TextInput
-              style={styles.dialogInput}
-              placeholder="e.g. Reliance lot assigned today"
-              placeholderTextColor="#94a3b8"
-              value={inlineRemarkInput}
-              onChangeText={setInlineRemarkInput}
-              autoCapitalize="sentences"
-            />
-
             <View style={styles.dialogActionsRow}>
               <TouchableOpacity 
                 style={styles.dialogCancelBtn}
@@ -6213,25 +6249,20 @@ export default function DashboardScreen({ user, token, apiUrl, onLogout, onUserU
                     Alert.alert('Validation Error', 'Please enter a client name.');
                     return;
                   }
-                  if (!inlineRemarkInput.trim()) {
-                    Alert.alert('Validation Error', 'Please enter an addition remark.');
-                    return;
-                  }
                   const name = ensureClientInLotMaster(inlineClientInput);
-                  const remark = inlineRemarkInput.trim();
                   const exists = assignments.some(item => Number(item.chamber_id) === Number(selectedChamber.id) && item.client_name.toLowerCase() === name.toLowerCase());
                   if (exists) {
                     Alert.alert('Duplicate Client', `"${name}" is already in the list.`);
                     return;
                   }
                   
-                  const success = addLocalAssignment(selectedChamber.id, selectedChamber.name, name, remark);
+                  const success = addLocalAssignment(selectedChamber.id, selectedChamber.name, name, '');
                   if (success) {
                     setInlineClientInput('');
                     setInlineRemarkInput('');
                     setShowAddClientModal(false);
                     loadLocalAssignmentsData(chambersList);
-                    reportDOActivity('ADD_CLIENT', `Added client "${name}" to ${selectedChamber.name} only with remark: ${remark}`, remark);
+                    reportDOActivity('ADD_CLIENT', `Added client "${name}" to ${selectedChamber.name} only`, '');
                     if (apiUrl && token) triggerSync(apiUrl, token, setSyncStatus);
                     setSelectedClient(name);
                     setTempInput('');
@@ -6708,6 +6739,58 @@ const styles = StyleSheet.create({
   chamberCardAlertBorder: {
     borderColor: '#ef4444', 
     borderWidth: 1.5,
+  },
+  chamberCardNeedsClients: {
+    borderColor: '#7dd3fc',
+    backgroundColor: '#f0f9ff',
+  },
+  setupClientsBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    backgroundColor: '#e0f2fe',
+    borderWidth: 1,
+    borderColor: '#7dd3fc',
+    borderRadius: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    marginBottom: 10,
+  },
+  setupClientsBannerIcon: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: '#ffffff',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  setupClientsBannerTitle: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: '#0c4a6e',
+  },
+  setupClientsBannerSub: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#0369a1',
+    marginTop: 2,
+    lineHeight: 15,
+  },
+  setupClientsBannerCta: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: '#0284c7',
+  },
+  addClientChip: {
+    backgroundColor: '#0284c7',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 999,
+  },
+  addClientChipText: {
+    fontSize: 11,
+    fontWeight: '800',
+    color: '#ffffff',
   },
   chamberCardHeader: {
     flexDirection: 'row',
